@@ -1,0 +1,12 @@
+# 本地数据/隐私（绝不上传）
+.dsh/
+*.log
+memory.json
+config.json
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
