@@ -4,6 +4,7 @@
 
 ## ✨ 核心特性
 
+- **🔄 静态常驻**：普通插件形态（组合加载），随 DSH 启动自动运行，重启不丢、无需批准
 - **📁 按项目独立记忆库**：每个项目一个独立数据库（`.dsh/memory-db/memory.json`），互不干扰；支持项目级独立开关与全局默认值
 - **📝 自动收集问答**：自动配对用户的提问与模型回答，记录发生时间、所属会话标题及**标题演变历史**（初始标题 → 于某时变更为新标题）
 - **🧭 三态智能分类器**：每轮提问先由常驻子代理（B 通道）或主模型内联（A 通道）判断意图——
@@ -39,9 +40,25 @@
 
 ## 🚀 使用
 
-### 安装
+### 安装（静态常驻版，开机自启）
 
-当前版本以 DeepSeek Harness 动态插件（Cordis）形式运行；DSH 重启后需要重新激活。**普通插件化（开机自启）正在开发中**。
+插件以**普通插件（静态组合插件）**形态运行，随 DSH 进程启动自动加载，**重启不丢、无需批准**：
+
+1. **安装包体**：将 `static/` 目录内容复制到 DSH profile 的 node_modules：
+   ```powershell
+   # 示例:web profile
+   Copy-Item static\package.json $env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-memory-db\
+   Copy-Item static\lib\*    $env:USERPROFILE\.dsh\profiles\web\node_modules\dsh-memory-db\lib\
+   ```
+2. **注册组合行**：在 `~/.dsh/profiles/web/cordis.patch.yml` 追加：
+   ```yaml
+   - insert:
+       - id: dsh-memory-db
+         name: 'dsh-memory-db'
+   ```
+3. **重启 DSH**（组合变更需重启生效），刷新浏览器页面。
+
+> 从 v0.1.0 动态版升级：首次启动自动迁移旧开关状态（storageDomain `memory_db` 域 / 项目 `config.json` → settings.yaml），现有项目开关与记忆数据不丢失。
 
 ### 开启记忆库
 
@@ -68,9 +85,14 @@
 
 ```
 dsh-memory-db/
-├── plugin/                  # 插件源码（Host / Client）
-│   ├── host.js              # Host 半部：收集 / 分类器 / 注入 / 管理网页 API
-│   └── client.js            # Client 半部：头部开关 / 记忆管理菜单 / 设置项
+├── static/                  # 静态常驻版（推荐，开机自启）
+│   ├── package.json         # npm 包声明（dsh.client 客户端注入）
+│   └── lib/
+│       ├── index.js         # Host: Service 类（收集/分类器/注入/API/管理网页）
+│       └── client.js        # Client bundle（头部开关/记忆管理/设置项）
+├── plugin/                  # 动态版源码（原型/历史参考）
+│   ├── host.js
+│   └── client.js
 ├── cordis/                  # 动态插件构建脚本（开发用）
 ├── docs/
 │   └── 上下文优化改进方案.md  # 设计文档（预算 / 分类器 / 缓存策略）
@@ -83,7 +105,7 @@ dsh-memory-db/
 - [x] 三态分类器（recall / continue / shift）+ 双通道（子代理 / 内联）
 - [x] 上下文预算化注入 + 动态历史压缩 + 缓存去重
 - [x] 管理网页 + 会话标题演变
-- [ ] **普通插件化，开机自启**（进行中）
+- [x] **普通插件化，开机自启**（静态常驻版 v0.2.0）
 - [ ] 记忆条目标注 / 手动修正
 - [ ] 跨项目记忆共享（可选）
 
