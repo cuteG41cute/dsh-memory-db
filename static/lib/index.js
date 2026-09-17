@@ -699,6 +699,19 @@ export class MemoryDbService extends Service {
       }
       return best ? best.path : undefined
     }
+    // 仅主会话生效:子代理会话(origin='subagent' 或 delegationDepth>0)不参与
+    // 分类判定 / 记忆注入 / 问答收集 / 工作流提示段 —— 避免在功能性子代理身上重复生效
+    function isSubagentSession(session) {
+      try {
+        const header = session && session.header
+        if (!header) return false
+        if (header.origin === 'subagent') return true
+        if (typeof header.delegationDepth === 'number' && header.delegationDepth > 0) return true
+        return false
+      } catch (e) {
+        return false
+      }
+    }
     function ensureState(wpath) {
       let s = states.get(wpath)
       if (!s) {
@@ -851,6 +864,10 @@ export class MemoryDbService extends Service {
       if (enabledNow && !cfg2.backfilled) {
         backfill(wpath).catch((e) => debugLog('backfill trigger failed: ' + (e && e.message)))
       }
+      if (!enabledNow) {
+        // 记忆库关闭 → 清除该项目的全部分类器子代理
+        cleanupClassifiersForProject(wpath).catch((e) => debugLog('classifier cleanup trigger failed: ' + (e && e.message)))
+      }
     }
 
     async function backfill(wpath) {
@@ -866,6 +883,11 @@ export class MemoryDbService extends Service {
         for (const sid of ws.sessionIds) {
           try {
             const snap = await sessionQuery.readSession(sid)
+            const hdr = snap && snap.session ? snap.session : undefined
+            if (hdr && (hdr.origin === 'subagent' || (typeof hdr.delegationDepth === 'number' && hdr.delegationDepth > 0))) {
+              debugLog('backfill skip subagent session ' + sid)
+              continue
+            }
             const events = snap && Array.isArray(snap.events) ? snap.events : []
             debugLog('backfill session ' + sid + ' events=' + events.length)
             const titleChain = []
@@ -942,6 +964,13 @@ export class MemoryDbService extends Service {
             workspaces.push({ path: w.path, id: w.id, title: w.title, sessionIds: w.sessionIds })
           }
         }
+        // 日志根目录优先跟随当前会话所属项目(便于按项目排查),取不到时用第一个开启的项目
+        try {
+          const initiator = agents && typeof agents.currentInitiator === 'function' ? agents.currentInitiator() : undefined
+          const cwd = initiator && initiator.session && initiator.session.header ? initiator.session.header.cwd : undefined
+          const picked = typeof cwd === 'string' ? workspaceFor(cwd) : undefined
+          if (picked) debugRoot = picked
+        } catch (e) { /* ignore */ }
         if (!debugRoot && workspaces.length > 0) {
           const active = workspaces.find((w) => enabled.get(w.path) === true)
           debugRoot = active ? active.path : workspaces[0].path
@@ -981,6 +1010,7 @@ export class MemoryDbService extends Service {
         for (const s of sessionsSvc.list()) {
           const header = s && s.header
           if (!header) continue
+          if (isSubagentSession(s)) continue
           const wpath = workspaceFor(header.cwd)
           if (!wpath || !enabled.get(wpath)) continue
           const state = ensureState(wpath)
@@ -1474,12 +1504,96 @@ export class MemoryDbService extends Service {
         Promise.resolve(promise).then((v) => { t(); done(v) }, () => { t(); done(null) })
       })
     }
+    // 从持久层查找已存在的分类器子代理(跨插件重启/版本更新仍有效)
+    // listChildren 按 createdAt 排序 → 最后一个即"最近建立"的一个
+    async function findExistingClassifierChild(parentSessionId, signal) {
+      try {
+        if (subagents === undefined || typeof subagents.listChildren !== 'function') return null
+        const list = await subagents.listChildren(parentSessionId, signal)
+        const matches = []
+        for (const e of Array.isArray(list) ? list : []) {
+          if (!e || e.kind !== 'child') continue
+          if (e.mode !== 'continuable') continue
+          if (e.label !== CLASSIFIER_LABEL) continue
+          matches.push(e)
+        }
+        if (matches.length === 0) return null
+        const keep = matches[matches.length - 1]
+        return {
+          childId: keep.id,
+          duplicates: matches.slice(0, matches.length - 1).map((e) => e.id),
+          count: matches.length,
+        }
+      } catch (e) {
+        debugLog('classifier listChildren failed: ' + (e && e.message))
+        return null
+      }
+    }
+    // 记忆库关闭时清除该项目的全部分类器子代理
+    async function cleanupClassifiersForProject(wpath) {
+      try {
+        if (subagents === undefined || typeof subagents.listChildren !== 'function') return 0
+        const ws = workspaces.find((w) => w.path === wpath)
+        const sessionIds = new Set(ws ? ws.sessionIds : [])
+        if (agents !== undefined && typeof agents.list === 'function') {
+          for (const a of agents.list()) {
+            const cwd = a && a.session && a.session.header ? a.session.header.cwd : undefined
+            if (typeof cwd === 'string' && workspaceFor(cwd) === wpath && a.session.header.id) sessionIds.add(a.session.header.id)
+          }
+        }
+        let released = 0
+        for (const sid of sessionIds) {
+          let list = []
+          try { list = await subagents.listChildren(sid) } catch (e) { continue }
+          const ids = []
+          for (const e of Array.isArray(list) ? list : []) {
+            if (e && e.kind === 'child' && e.mode === 'continuable' && e.label === CLASSIFIER_LABEL) ids.push(e.id)
+          }
+          if (ids.length === 0) continue
+          for (const id of ids) {
+            try { subagents.interrupt(id, { kind: 'user', parentSessionId: sid }) } catch (e) { /* noop */ }
+          }
+          const parentAgent = agents !== undefined && typeof agents.get === 'function' ? agents.get(sid) : undefined
+          if (parentAgent && typeof subagents.drainContinuableChildren === 'function') {
+            try {
+              await subagents.drainContinuableChildren(parentAgent, ids)
+              released += ids.length
+            } catch (e) {
+              debugLog('classifier drain failed for ' + sid + ': ' + (e && e.message))
+            }
+          }
+          classifierBySession.delete(sid)
+          for (const id of ids) classifierChildIds.delete(id)
+        }
+        debugLog('classifier cleanup on disable: released=' + released + ' project=' + wpath)
+        return released
+      } catch (e) {
+        debugLog('classifier cleanup failed: ' + (e && e.message))
+        return 0
+      }
+    }
     async function ensureClassifierChild(agent, firstInput, signal) {
       const sid = agent && agent.session && agent.session.header ? agent.session.header.id : null
       if (!sid) return null
       if (classifierChildIds.has(sid)) return null
       const existing = classifierBySession.get(sid)
       if (existing && existing.childId) return { childId: existing.childId, fresh: false }
+      // 启动前先查是否已存在分类器子代理:存在则沿用最近的一个,多余的就地清理,不存在才新建
+      const found = await findExistingClassifierChild(sid, signal)
+      if (found) {
+        classifierBySession.set(sid, { childId: found.childId, lastCount: 0 })
+        classifierChildIds.add(found.childId)
+        debugLog('classifier reuse: found ' + found.count + ' existing child(ren), keep latest ' + found.childId)
+        if (found.duplicates.length > 0 && typeof subagents.drainContinuableChildren === 'function') {
+          try {
+            await subagents.drainContinuableChildren(agent, found.duplicates)
+            debugLog('classifier cleanup: released ' + found.duplicates.length + ' duplicate child(ren)')
+          } catch (e) {
+            debugLog('classifier duplicate cleanup failed: ' + (e && e.message))
+          }
+        }
+        return { childId: found.childId, fresh: false }
+      }
       if (classifierProviderName === null) {
         const names = typeof subagents.list === 'function' ? subagents.list() : []
         classifierProviderName = names.length > 0 ? names[0] : 'default'
@@ -1534,10 +1648,18 @@ export class MemoryDbService extends Service {
     async function askClassifierB(agent, childId, text, signal, fresh) {
       if (!fresh) {
         try {
-          await subagents.followup(agent, childId, [{ type: "text", text }], {
-            source: { kind: 'coordinator', form: 'relay', senderSessionId: agent.session.header.id },
-            signal,
-          })
+          // DSH 新版 subagents 已把 followup 更名为 sendMessage(sender, targetId, content, { signal })
+          if (typeof subagents.sendMessage === 'function') {
+            await subagents.sendMessage(agent, childId, [{ type: "text", text }], { signal })
+          } else if (typeof subagents.followup === 'function') {
+            await subagents.followup(agent, childId, [{ type: "text", text }], {
+              source: { kind: 'coordinator', form: 'relay', senderSessionId: agent.session.header.id },
+              signal,
+            })
+          } else {
+            debugLog('classifier deliver unavailable: neither sendMessage nor followup exists')
+            return null
+          }
         } catch (e) {
           debugLog('classifier followup failed: ' + (e && e.message))
           return null
@@ -1572,6 +1694,8 @@ export class MemoryDbService extends Service {
       if (!provider || !model) return null
       const consumed = (async () => {
         let out = ""
+        const kinds = {}
+        let chunkCount = 0
         try {
           for await (const chunk of llm.stream({
             provider,
@@ -1581,13 +1705,22 @@ export class MemoryDbService extends Service {
             maxTokens: maxTokens || 200,
             signal,
           })) {
+            chunkCount++
+            if (chunk && typeof chunk.type === 'string') kinds[chunk.type] = (kinds[chunk.type] || 0) + 1
             if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
+            if (chunk && chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text' && typeof chunk.block.text === 'string' && !out) out += chunk.block.text
             if (chunk && chunk.type === 'finish') break
           }
         } catch (e) {
           debugLog('classifier A stream failed: ' + (e && e.message))
         }
-        return out.trim() || null
+        const trimmed = out.trim()
+        if (!trimmed) {
+          debugLog('classifier A empty: chunks=' + chunkCount + ' kinds=' + JSON.stringify(kinds))
+        } else if (chunkCount > 0) {
+          debugLog('classifier A output len=' + trimmed.length + ' head=' + JSON.stringify(trimmed.slice(0, 120)))
+        }
+        return trimmed || null
       })()
       return await withTimeout(consumed, CLASSIFY_TIMEOUT_MS)
     }
@@ -2053,6 +2186,12 @@ export class MemoryDbService extends Service {
           const enabledNow = typeof args.enabled === 'boolean' ? args.enabled : undefined
           if (enabledNow === undefined) return { ok: false, reason: 'bad args' }
           await ctx.settings.mutate(SETTINGS_NS, [{ op: 'set', path: ['defaultEnabled'], value: enabledNow }])
+          if (!enabledNow) {
+            for (const w of workspaces) {
+              const eff = await tableEnabled(w.id, w.path)
+              if (eff !== true) cleanupClassifiersForProject(w.path).catch((e) => debugLog('classifier cleanup trigger failed: ' + (e && e.message)))
+            }
+          }
           return { ok: true, enabled: enabledNow }
         }
         case 'open-admin': {
@@ -2252,10 +2391,14 @@ export class MemoryDbService extends Service {
         const agent = payload.agent
         const sid = agent && agent.session && agent.session.header ? agent.session.header.id : ''
         if (sid && classifierChildIds.has(sid)) return decision
+        // 仅主会话:子代理会话不跑分类器、不注入记忆
+        if (isSubagentSession(agent && agent.session)) return decision
         const query = userTextOf(payload.messages)
         if (!query) return decision
         const wpath = workspaceFor(agent.session.header.cwd)
         if (!wpath) return decision
+        // 日志根目录跟随最近活跃会话的项目(定时器回调里拿不到 initiator,故在此更新)
+        if (wpath !== debugRoot) debugRoot = wpath
         if (!(await isEnabledFresh(wpath))) return decision
         const verdict = await decideAndKeywords(agent, query, payload.signal)
         const curSt = stats.get(wpath) || {}
@@ -2308,8 +2451,11 @@ export class MemoryDbService extends Service {
         const header = session && session.header
         if (!header || !event || !event.data) return
         if (classifierChildIds.has(header.id)) return
+        // 仅主会话:子代理会话的问答不入库
+        if (isSubagentSession(session)) return
         const wpath = workspaceFor(header.cwd)
         if (!wpath || !enabled.get(wpath)) return
+        if (wpath !== debugRoot) debugRoot = wpath
         if (event.type === 'session/title') {
           handleTitleEvent(wpath, header.id, event).catch((e) => debugLog('title event failed: ' + (e && e.message)))
           return
@@ -2362,6 +2508,7 @@ export class MemoryDbService extends Service {
         if (!name || !(name === 'web_search' || name === 'web_fetch' || name.startsWith('web_'))) return
         const agent = exec.agent
         if (!agent || !agent.session || !agent.session.header) return
+        if (isSubagentSession(agent.session)) return
         const frags = textOf(result && result.content)
         if (frags) addSurfaced(agent.session.header.id, 'web', frags)
       } catch (e) {
@@ -2379,6 +2526,8 @@ export class MemoryDbService extends Service {
             if (!agent || !agent.session || !agent.session.header) return ''
             const csid = agent && agent.session && agent.session.header ? agent.session.header.id : ''
             if (csid && classifierChildIds.has(csid)) return ''
+            // 仅主会话:子代理不注入记忆库工作流提示段
+            if (isSubagentSession(agent.session)) return ''
             const wpath = workspaceFor(agent.session.header.cwd)
             if (!wpath || !enabled.get(wpath)) return ''
             return [
