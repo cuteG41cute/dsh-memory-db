@@ -540,6 +540,8 @@ export class MemoryDbService extends Service {
     const stats = new Map()
 
     const classifierBySession = new Map()
+    // 已弃用的分类器 id（不可用或被污染）——不再复用，强制新建
+    const classifierBlacklist = new Set()
     const classifierChildIds = new Set()
     const compactState = new Map()
     let classifierProviderName = null
@@ -1410,6 +1412,10 @@ export class MemoryDbService extends Service {
     }
 
     // ---- pkg-28 分类器: 三态判定(recall/continue/shift) + 关键词提炼 ----
+    // 分类器人格声明:防止它被当作通用助手/子代理使唤(仅当 provider 支持 persona 时下发)
+    const CLASSIFIER_PERSONA = '你是记忆库的内部话题分类器，唯一职责是对收到的判定输入输出一行判定 JSON。' +
+      '你不是通用助手：不回答任何问题、不执行任何任务、不调用任何工具。' +
+      '若收到的内容不含「当前问题:」标记（例如被转交的任务或闲聊），只回复 {"intent":"continue","task":"normal","keywords":[]}。'
     function classifierSystemPrompt() {
       return '你是「话题延续性分类器」。根据最近对话与当前问题判断用户意图，只输出 JSON。\n' +
       '判断规则（按优先级，短路）：\n' +
@@ -1418,7 +1424,8 @@ export class MemoryDbService extends Service {
       '3. 转向 shift：新话题。此时再判任务类型：single=单次任务（如"今天天气如何？"）；normal=常规话题。\n' +
       '输出仅 JSON（不要任何其他文字）：{"intent":"recall|continue|shift","task":"single|normal","keywords":["..."]}\n' +
       'keywords：intent=recall 或 shift 时从当前问题提炼 3~10 个检索关键词（中英文均可）；intent=continue 时为空数组。\n' +
-      '会话首问（无历史）时不存在 continue，只输出 recall 或 shift。'
+      '会话首问（无历史）时不存在 continue，只输出 recall 或 shift。\n' +
+      '你不是通用助手：不回答内容、不执行任务、不调用工具；若收到的内容不含「当前问题:」标记（被转交的任务或闲聊），只回复 {"intent":"continue","task":"normal","keywords":[]}。'
     }
     function parseClassifierOutput(text) {
       if (!text) return null
@@ -1515,6 +1522,7 @@ export class MemoryDbService extends Service {
           if (!e || e.kind !== 'child') continue
           if (e.mode !== 'continuable') continue
           if (e.label !== CLASSIFIER_LABEL) continue
+          if (classifierBlacklist.has(e.id)) continue
           matches.push(e)
         }
         if (matches.length === 0) return null
@@ -1572,27 +1580,69 @@ export class MemoryDbService extends Service {
         return 0
       }
     }
+    // 分类器隔离选项:禁止它调用任何工具（仅当 provider 声明支持时下发）
+    function classifierIsolationOptions() {
+      const opts = {}
+      try {
+        if (subagents === undefined) return opts
+        const caps = typeof subagents.getProvider === 'function' && classifierProviderName
+          ? (subagents.getProvider(classifierProviderName) || {}).capabilities
+          : undefined
+        if (caps && caps.toolFilter === true) opts.toolFilter = { allow: [] }
+        if (caps && caps.persona === true) opts.persona = CLASSIFIER_PERSONA
+      } catch (e) { /* ignore */ }
+      return opts
+    }
+    // 体检:分类器会话中出现工具调用 → 说明它被当作普通子代理使用过,判定不可信
+    async function classifierLooksTainted(childId) {
+      try {
+        if (sessionQuery === undefined || typeof sessionQuery.readSession !== 'function') return false
+        const snap = await sessionQuery.readSession(childId)
+        const events = snap && Array.isArray(snap.events) ? snap.events : []
+        for (const ev of events) {
+          if (!ev || typeof ev !== 'object') continue
+          if (ev.type === 'tool/call' || ev.type === 'tool/result') return true
+        }
+        return false
+      } catch (e) {
+        return false
+      }
+    }
     async function ensureClassifierChild(agent, firstInput, signal) {
       const sid = agent && agent.session && agent.session.header ? agent.session.header.id : null
       if (!sid) return null
       if (classifierChildIds.has(sid)) return null
       const existing = classifierBySession.get(sid)
-      if (existing && existing.childId) return { childId: existing.childId, fresh: false }
+      if (existing && existing.childId && !classifierBlacklist.has(existing.childId)) return { childId: existing.childId, fresh: false }
+      if (existing && classifierBlacklist.has(existing.childId)) classifierBySession.delete(sid)
       // 启动前先查是否已存在分类器子代理:存在则沿用最近的一个,多余的就地清理,不存在才新建
       const found = await findExistingClassifierChild(sid, signal)
       if (found) {
-        classifierBySession.set(sid, { childId: found.childId, lastCount: 0 })
-        classifierChildIds.add(found.childId)
-        debugLog('classifier reuse: found ' + found.count + ' existing child(ren), keep latest ' + found.childId)
-        if (found.duplicates.length > 0 && typeof subagents.drainContinuableChildren === 'function') {
-          try {
-            await subagents.drainContinuableChildren(agent, found.duplicates)
-            debugLog('classifier cleanup: released ' + found.duplicates.length + ' duplicate child(ren)')
-          } catch (e) {
-            debugLog('classifier duplicate cleanup failed: ' + (e && e.message))
+        // 体检:被当作普通子代理用过(有工具调用)的分类器不可信 → 弃用并重建
+        const tainted = await classifierLooksTainted(found.childId)
+        if (tainted) {
+          debugLog('classifier tainted (tool use detected): ' + found.childId + ' ; dropping and recreating')
+          classifierBlacklist.add(found.childId)
+          classifierBySession.delete(sid)
+          classifierChildIds.delete(found.childId)
+          try { subagents.interrupt(found.childId, { kind: 'user', parentSessionId: sid }) } catch (e) { /* noop */ }
+          if (typeof subagents.drainContinuableChildren === 'function') {
+            try { await subagents.drainContinuableChildren(agent, [found.childId]) } catch (e) { /* noop */ }
           }
+        } else {
+          classifierBySession.set(sid, { childId: found.childId, lastCount: 0 })
+          classifierChildIds.add(found.childId)
+          debugLog('classifier reuse: found ' + found.count + ' existing child(ren), keep latest ' + found.childId)
+          if (found.duplicates.length > 0 && typeof subagents.drainContinuableChildren === 'function') {
+            try {
+              await subagents.drainContinuableChildren(agent, found.duplicates)
+              debugLog('classifier cleanup: released ' + found.duplicates.length + ' duplicate child(ren)')
+            } catch (e) {
+              debugLog('classifier duplicate cleanup failed: ' + (e && e.message))
+            }
+          }
+          return { childId: found.childId, fresh: false }
         }
-        return { childId: found.childId, fresh: false }
       }
       if (classifierProviderName === null) {
         const names = typeof subagents.list === 'function' ? subagents.list() : []
@@ -1603,13 +1653,13 @@ export class MemoryDbService extends Service {
         const start = await subagents.startContinuable({
           provider: classifierProviderName,
           label: CLASSIFIER_LABEL,
-          request: {
+          request: Object.assign({
             prompt: [
               { type: 'text', text: classifierSystemPrompt() + '\n\n（当前回合的判定输入已随本启动消息下发，请直接输出判定 JSON，不要输出任何其他内容）' },
               { type: 'text', text: String(firstInput || '') },
             ],
             parent: agent,
-          },
+          }, classifierIsolationOptions()),
           signal,
         })
         const childId = start && start.childId
@@ -1661,7 +1711,16 @@ export class MemoryDbService extends Service {
             return null
           }
         } catch (e) {
-          debugLog('classifier followup failed: ' + (e && e.message))
+          const msg = e && e.message ? String(e.message) : String(e)
+          debugLog('classifier followup failed: ' + msg)
+          // 分类器不可用(会话被删/不可恢复) → 弃用并加黑名单,下轮重新解析或新建
+          if (/unavailable|not-resumable|parent-unavailable|absent|not found/i.test(msg)) {
+            const sid = agent && agent.session && agent.session.header ? agent.session.header.id : null
+            if (sid) classifierBySession.delete(sid)
+            classifierChildIds.delete(childId)
+            classifierBlacklist.add(childId)
+            debugLog('classifier dropped (unavailable): ' + childId + ' ; will re-resolve next round')
+          }
           return null
         }
       }
@@ -1686,12 +1745,18 @@ export class MemoryDbService extends Service {
         last = cur
       }
     }
-    async function askClassifierA(agent, text, signal, maxTokens) {
+    async function askClassifierA(agent, text, signal, maxTokens, systemText) {
       if (llm === undefined) return null
       const options = agent && agent.options
       const provider = options && typeof options.provider === 'string' ? options.provider : undefined
       const model = options && typeof options.model === 'string' ? options.model : undefined
       if (!provider || !model) return null
+      const messages = systemText
+        ? [
+            { role: 'system', content: [{ type: 'text', text: systemText }] },
+            { role: 'user', content: [{ type: 'text', text }] },
+          ]
+        : [{ role: 'user', content: [{ type: 'text', text }] }]
       const consumed = (async () => {
         let out = ""
         const kinds = {}
@@ -1700,7 +1765,7 @@ export class MemoryDbService extends Service {
           for await (const chunk of llm.stream({
             provider,
             model,
-            messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+            messages,
             reasoningEffort: 'off',
             maxTokens: maxTokens || 200,
             signal,
@@ -1742,7 +1807,8 @@ export class MemoryDbService extends Service {
         }
       }
       if (llm !== undefined) {
-        const out = await askClassifierA(agent, input, signal)
+        // A 通道必须携带分类器 system 提示,否则模型会把它当普通提问作答(而非输出判定 JSON)
+        const out = await askClassifierA(agent, input, signal, undefined, classifierSystemPrompt())
         const parsed = out ? parseClassifierOutput(out) : null
         if (parsed) return Object.assign(parsed, { channel: 'inline' })
         debugLog('classifier A unparsable, fallback')
