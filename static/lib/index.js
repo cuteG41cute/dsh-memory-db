@@ -525,6 +525,10 @@ export class MemoryDbService extends Service {
     const CLASSIFY_POLL_MS = 300
     const CLASSIFY_ROUNDS = 5
     const CLASSIFIER_LABEL = "memory-db 话题分类器"
+    // 分类通道:'inline'(默认) = 主模型隐身调用,零子代理、零完成通知、零额外回合;
+    // 'subagent' = 常驻分类子代理(成本低但每次判定结算都会给父会话发一条 runtime 通知,
+    //   通知到达空闲父会话会额外触发一次模型请求,反而更贵)
+    const CLASSIFIER_MODE = 'inline'
 
     const workspaces = []
     const enabled = new Map()
@@ -757,10 +761,42 @@ export class MemoryDbService extends Service {
     async function writeConfig(wpath, cfg) {
       if (!fs) return
       const target = await fs.resolve(joinPath(wpath, CONFIG_REL))
-      await fs.writeText(target, JSON.stringify({
-        enabled: cfg.enabled === true,
-        backfilled: cfg.backfilled === true,
-      }, null, 2), undefined, undefined, writePolicy(wpath))
+      // 仅在显式提供 enabled 时写入 —— 静态版的真实开关在 settings.yaml / storage 域,
+      // 项目内 config.json 的 enabled 只是旧版回退值,留着会误导排查
+      const out = { backfilled: cfg.backfilled === true }
+      if (typeof cfg.enabled === 'boolean') out.enabled = cfg.enabled
+      await fs.writeText(target, JSON.stringify(out, null, 2), undefined, undefined, writePolicy(wpath))
+    }
+    // 开关实际生效来源(排查用:避免被项目内失效的 config.json 误导)
+    async function enabledSource(wpath) {
+      try {
+        const ws = workspaces.find((w) => w.path === wpath)
+        const raw = ctx.settings.get(SETTINGS_NS)
+        const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
+        if (ws && typeof projects[ws.id] === 'boolean') return 'settings.yaml(项目)'
+        if (raw && typeof raw.defaultEnabled === 'boolean') return 'settings.yaml(默认)'
+        if (table !== null) {
+          if (ws && table.get(ws.id) !== undefined) return 'storage:memory_db(项目,旧)'
+          if (table.get(KEY_DEFAULT) !== undefined) return 'storage:memory_db(默认,旧)'
+        }
+        const cfg = await readConfig(wpath)
+        if (cfg.exists && typeof cfg.enabled === 'boolean') return 'config.json(旧,回退)'
+        return '内置默认'
+      } catch (e) { return 'unknown' }
+    }
+    // 清理项目内 config.json 中已废弃的 enabled 字段(仅当 settings 已有权威决定时)
+    async function deprecateLegacyConfigField(wpath) {
+      try {
+        const cfg = await readConfig(wpath)
+        if (!cfg.exists || typeof cfg.enabled !== 'boolean') return
+        const raw = ctx.settings.get(SETTINGS_NS)
+        const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
+        const ws = workspaces.find((w) => w.path === wpath)
+        const hasDecision = (ws && typeof projects[ws.id] === 'boolean') || (raw && typeof raw.defaultEnabled === 'boolean')
+        if (!hasDecision) return
+        await writeConfig(wpath, { backfilled: cfg.backfilled })
+        debugLog('legacy config.json enabled field removed: ' + wpath)
+      } catch (e) { /* ignore */ }
     }
     async function loadDb(wpath) {
       const state = ensureState(wpath)
@@ -1289,7 +1325,16 @@ export class MemoryDbService extends Service {
       const state = ensureState(wpath)
       await loadDb(wpath)
       const keywords = verdict.keywords && verdict.keywords.length > 0 ? verdict.keywords : tokenize(query).slice(0, 10)
-      const hits = searchByKeywords(state.db.entries, keywords)
+      const allHits = searchByKeywords(state.db.entries, keywords)
+      // 同会话过滤:本会话自己的历史已在上下文里,再注入一遍纯属浪费
+      const curSid = agent && agent.session && agent.session.header ? agent.session.header.id : undefined
+      const hits = curSid ? allHits.filter((h) => h.sessionId !== curSid) : allHits
+      const sameSessionSkipped = allHits.length - hits.length
+      if (sameSessionSkipped > 0) {
+        const c0 = stats.get(wpath) || {}
+        bumpStats(wpath, { sameSessionSkipped: (c0.sameSessionSkipped || 0) + sameSessionSkipped })
+        debugLog('inject filter: skipped ' + sameSessionSkipped + ' same-session entries')
+      }
       if (hits.length === 0) return null
       addSurfaced(agent.session.header.id, "memory", hits.map((h) => h.question + "\n" + h.answer))
       const mode = verdict.task === 'single' ? 'single' : 'normal'
@@ -1301,7 +1346,7 @@ export class MemoryDbService extends Service {
         text = await buildStandardText(state.db, hits, budgets, keywords, agent, signal)
       }
       if (!text) return null
-      return { text, mode, budgets }
+      return { text, mode, budgets, count: hits.length }
     }
 
 
@@ -1793,25 +1838,41 @@ export class MemoryDbService extends Service {
       const recent = recentRoundsText(agent, CLASSIFY_ROUNDS)
       const isFirst = !hasPreviousUser(agent)
       const input = buildClassifierInput(query, recent, isFirst)
-      if (subagents !== undefined) {
+      const tryInline = async () => {
+        if (llm === undefined) return null
+        // A 通道必须携带分类器 system 提示,否则模型会把它当普通提问作答(而非输出判定 JSON)
+        const out = await askClassifierA(agent, input, signal, undefined, classifierSystemPrompt())
+        const parsed = out ? parseClassifierOutput(out) : null
+        if (parsed) return Object.assign(parsed, { channel: 'inline' })
+        debugLog('classifier A unparsable, fallback')
+        return null
+      }
+      const trySubagent = async () => {
+        if (subagents === undefined) return null
         try {
           const childRec = await ensureClassifierChild(agent, input, signal)
           if (childRec && childRec.childId) {
             const out = await askClassifierB(agent, childRec.childId, input, signal, childRec.fresh === true)
             const parsed = out ? parseClassifierOutput(out) : null
             if (parsed) return Object.assign(parsed, { channel: 'subagent' })
-            debugLog('classifier B unparsable, fallback A')
+            debugLog('classifier B unparsable')
           }
         } catch (e) {
           debugLog('classifier B failed: ' + (e && e.message))
         }
+        return null
       }
-      if (llm !== undefined) {
-        // A 通道必须携带分类器 system 提示,否则模型会把它当普通提问作答(而非输出判定 JSON)
-        const out = await askClassifierA(agent, input, signal, undefined, classifierSystemPrompt())
-        const parsed = out ? parseClassifierOutput(out) : null
-        if (parsed) return Object.assign(parsed, { channel: 'inline' })
-        debugLog('classifier A unparsable, fallback')
+      // 默认 inline:不创建子代理 → 不产生 runtime 完成通知 → 不额外唤醒父会话
+      if (CLASSIFIER_MODE === 'subagent') {
+        const b = await trySubagent()
+        if (b) return b
+        const a = await tryInline()
+        if (a) return a
+      } else {
+        const a = await tryInline()
+        if (a) return a
+        const b = await trySubagent()
+        if (b) return b
       }
       return { intent: 'shift', task: 'normal', keywords: tokenize(query).slice(0, 10), channel: 'fallback' }
     }
@@ -2422,13 +2483,15 @@ export class MemoryDbService extends Service {
             '标准注入上限=' + budgets.injectCap + '(40%∩可用)',
             '轻量注入上限=' + lightCap + '(5%∩可用)',
             '历史预算=' + budgets.historyCap + '(内容上限−注入量)',
-            '分类通道: B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
+            '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
             '压缩: ' + (st.compactions || 0) + ' 次' + (st.lastCompactAt ? (' 最近 ' + new Date(st.lastCompactAt).toLocaleTimeString()) : '') + ' 历史预算=' + budgets.historyCap + '(内容上限−注入量)',
-            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 判定[' + intentText + ']',
+            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + ']',
+            '最近注入: ' + ((st.lastInjected) || '-'),
           ].join('; ')
+          const source = await enabledSource(wpath)
           const note = (resolved
-            ? '记忆库已开启，数据库文件: .dsh/memory-db/memory.json；开关存储: ' + (table === null ? (openError || '不可用(回退文件配置)') : 'memory_db 域') + '；管理网页: http://127.0.0.1:3080/memory-db-admin'
-            : '记忆库未开启。开启: 点击会话顶部「记忆库」开关，或用本工具 enable。开关存储: ' + (table === null ? (openError || '不可用(回退文件配置)') : 'memory_db 域') + (cfg.exists ? '' : '；旧配置文件不存在')) + '；预算: ' + budgetText
+            ? '记忆库已开启，数据库文件: .dsh/memory-db/memory.json；开关实际来源: ' + source + '；管理网页: http://127.0.0.1:3080/memory-db-admin'
+            : '记忆库未开启。开启: 点击会话顶部「记忆库」开关，或用本工具 enable。开关实际来源: ' + source + (cfg.exists ? '' : '；旧配置文件不存在')) + '；预算: ' + budgetText
           return {
             action,
             project: wpath,
@@ -2503,7 +2566,11 @@ export class MemoryDbService extends Service {
         const messages = [...decision.messages]
         messages.splice(idx + 1, 0, ctxMsg)
         const cur2 = stats.get(wpath) || {}
-        bumpStats(wpath, { injections: (cur2.injections || 0) + 1, lastMode: inject.mode })
+        bumpStats(wpath, {
+          injections: (cur2.injections || 0) + 1,
+          lastMode: inject.mode,
+          lastInjected: inject.mode + ' ' + (inject.count || 0) + '条/' + inject.text.length + '字符',
+        })
         debugLog('pre-step: injected memory context for ' + agent.id)
         return { kind: 'enter', messages }
       } catch (e) {
@@ -2527,24 +2594,44 @@ export class MemoryDbService extends Service {
           return
         }
         if (event.type === 'turn/start') {
-          pendingTurns.set(header.id, { turn: event.data.turn, question: '', answer: '', time: 0 })
+          pendingTurns.set(header.id, { turn: event.data.turn, question: '', answer: '', time: 0, noticeSeen: false })
           loadDb(wpath).catch(() => {})
           return
         }
         if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return
         const pending = pendingTurns.get(header.id)
         if (!pending) return
+        // 后台子代理完成通知(runtime 生成,user-role):它触发的主 agent 回复不是对用户问题的回答,
+        // 若让它覆盖本回合答案,会造成"问题与答案错配、真实答案丢失"
+        const NOTICE_RE = /Background subagent [0-9a-fA-F-]{6,} (finished|was stopped|ran out of room|declined|failed)/
         if (event.type === 'user/message') {
           const m = event.data
-          if (m && m.source && m.source.kind === 'user') {
-            const t = textOf(m.content)
-            if (t) pending.question = pending.question ? pending.question + '\n' + t : t
+          const evTurn = event.data && typeof event.data.turn === 'number' ? event.data.turn : undefined
+          const txt = m ? textOf(m.content) : ''
+          const turnOk = evTurn === undefined || evTurn === pending.turn
+          if (turnOk && txt && NOTICE_RE.test(txt)) {
+            pending.noticeSeen = true
+            debugLog('collect: subagent notice seen (turn ' + pending.turn + ') ; later assistants will not override an existing answer')
+          } else if (turnOk && m && m.source && m.source.kind === 'user' && txt) {
+            pending.question = pending.question ? pending.question + '\n' + txt : txt
           }
         } else if (event.type === 'assistant/message') {
           const m = event.data.message
-          if (m && m.source && m.source.kind === 'model') {
+          const evTurn = event.data && typeof event.data.turn === 'number' ? event.data.turn : undefined
+          const turnOk = evTurn === undefined || evTurn === pending.turn
+          if (m && m.source && m.source.kind === 'model' && turnOk) {
             const t = textOf(m.content)
-            if (t) { pending.answer = t; pending.time = event.time }
+            if (t) {
+              // 通知之后的回复不再覆盖已有答案(答案已存在时);仅当尚无答案才接受(避免真丢答案)
+              if (!pending.noticeSeen || !pending.answer) {
+                pending.answer = t
+                pending.time = event.time
+              } else {
+                debugLog('collect skip: assistant after subagent notice (turn ' + pending.turn + ')')
+              }
+            }
+          } else if (m && m.source && m.source.kind === 'model' && evTurn !== undefined) {
+            debugLog('collect skip: assistant of turn ' + evTurn + ' while pending turn ' + pending.turn)
           }
         } else if (event.type === 'turn/end' && event.data.turn === pending.turn) {
           const q = (pending.question || '').trim()
@@ -2617,6 +2704,7 @@ export class MemoryDbService extends Service {
 
     await refreshProjects()
     await migrateLegacySettings().catch((e) => debugLog('migrate trigger failed: ' + (e && e.message)))
+    for (const w of workspaces) { await deprecateLegacyConfigField(w.path).catch(() => {}) }
     try {
       const initiator = agents && typeof agents.currentInitiator === 'function' ? agents.currentInitiator() : undefined
       debugLog('apply: initiator=' + (initiator ? initiator.id : 'none'))
