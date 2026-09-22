@@ -1802,37 +1802,46 @@ export class MemoryDbService extends Service {
             { role: 'user', content: [{ type: 'text', text }] },
           ]
         : [{ role: 'user', content: [{ type: 'text', text }] }]
-      const consumed = (async () => {
+      const budget = maxTokens && maxTokens > 200 ? maxTokens : 1024
+      const streamOnce = (extra) => (async () => {
         let out = ""
         const kinds = {}
-        let chunkCount = 0
+        let finishReason = null
+        let usage = null
         try {
-          for await (const chunk of llm.stream({
+          for await (const chunk of llm.stream(Object.assign({
             provider,
             model,
             messages,
-            reasoningEffort: 'off',
-            maxTokens: maxTokens || 200,
+            maxTokens: budget,
             signal,
-          })) {
-            chunkCount++
+          }, extra))) {
             if (chunk && typeof chunk.type === 'string') kinds[chunk.type] = (kinds[chunk.type] || 0) + 1
             if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
             if (chunk && chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text' && typeof chunk.block.text === 'string' && !out) out += chunk.block.text
-            if (chunk && chunk.type === 'finish') break
+            if (chunk && chunk.type === 'usage' && chunk.usage) usage = chunk.usage
+            if (chunk && chunk.type === 'finish') {
+              finishReason = chunk.reason ? (chunk.reason.kind || JSON.stringify(chunk.reason)) : null
+              break
+            }
           }
         } catch (e) {
           debugLog('classifier A stream failed: ' + (e && e.message))
         }
-        const trimmed = out.trim()
-        if (!trimmed) {
-          debugLog('classifier A empty: chunks=' + chunkCount + ' kinds=' + JSON.stringify(kinds))
-        } else if (chunkCount > 0) {
-          debugLog('classifier A output len=' + trimmed.length + ' head=' + JSON.stringify(trimmed.slice(0, 120)))
-        }
-        return trimmed || null
+        return { text: out.trim(), kinds, finishReason, usage }
       })()
-      return await withTimeout(consumed, CLASSIFY_TIMEOUT_MS)
+      // 第一次:关闭思考(reasoningEffort=off)以降本
+      const first = await withTimeout(streamOnce({ reasoningEffort: 'off' }), CLASSIFY_TIMEOUT_MS)
+      if (first && first.text) return first.text
+      if (first) debugLog('classifier A empty(off): kinds=' + JSON.stringify(first.kinds) + ' finish=' + first.finishReason + ' usage=' + JSON.stringify(first.usage))
+      // 第二次:不带 reasoningEffort 重试 —— 部分适配器不接受 'off',会立即空结束
+      const second = await withTimeout(streamOnce({}), CLASSIFY_TIMEOUT_MS)
+      if (second && second.text) {
+        debugLog('classifier A ok without reasoningEffort (adapter may not accept off)')
+        return second.text
+      }
+      if (second) debugLog('classifier A empty(no-effort): kinds=' + JSON.stringify(second.kinds) + ' finish=' + second.finishReason + ' usage=' + JSON.stringify(second.usage))
+      return null
     }
     async function decideAndKeywords(agent, query, signal) {
       const recent = recentRoundsText(agent, CLASSIFY_ROUNDS)
