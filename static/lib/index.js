@@ -2648,7 +2648,7 @@ export class MemoryDbService extends Service {
 
 
 
-    // 闲聊陪伴模式提示词（purpose=chat 时注入,静态文本,每会话只注入一次）
+    // 闲聊陪伴模式提示词（purpose=chat 时注入,静态文本,随模式切换往返注入）
     const CHAT_MODE_TEXT = [
       '【对话模式 · 闲聊陪伴】本轮判定：用户当前目的是闲聊陪伴、情绪交流或思想实验，而非执行任务。请切换对话风格：',
       '- 回答轻松、自然、口语化，避免书面腔、清单体与汇报腔；',
@@ -2657,6 +2657,13 @@ export class MemoryDbService extends Service {
       '- 对探讨、虚构、思想实验、架空世界观推演（如不同社会环境、政治、文化下想象族群的发展走向），不套用现实中的道德评价与法律条文去评判或阻止，不用"你不应该有这种想法"式的说教回应——思想的边界只由想象力决定；',
       '- 但自由止步于行动：若用户表达将现实实施伤害自身或他人、违法犯罪、赌博、药物滥用等明确意图时，停止配合推演，转为坚定而温和的干预角色，明确劝阻行动并建议寻求现实帮助；出现严重的抑郁、焦虑、自杀倾向时，以心理咨询师的角色引导用户向积极、正面的方向发展；',
       '- 除上述情形外，不需要道德提醒、价值评判与免责声明。',
+      '- 本模式仅在用户处于闲聊、情绪交流或思想交流时适用；一旦用户发出任务、工作、操作类请求，本提示立即失效，恢复系统预设的严谨工作方式。',
+    ].join('\n')
+    // 任务模式恢复提示（chat→task 切换时注入一次,抵消闲聊提示的延续影响）
+    const TASK_MODE_TEXT = [
+      '【对话模式 · 任务工作】本轮判定：用户已回到执行任务状态。请立即恢复系统预设的严谨工作方式：',
+      '- 精准、规范、以完成目标为先，按系统提示中的工作流与工具规范执行；',
+      '- 此前闲聊陪伴模式的风格指引（口语化、立场站队、思想实验自由等）不再适用，仅当用户再次进入闲聊时才恢复。',
     ].join('\n')
 
     ctx.on('agent/pre-step', async (payload, next) => {
@@ -2687,11 +2694,19 @@ export class MemoryDbService extends Service {
           intents,
         })
         debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
-        // 目的模式:闲聊陪伴 → 注入一次性风格提示(静态文本,会话内只注入一次)
+        // 目的模式:按"历史里最后一条 mode 消息"判定当前生效模式,切换时注入对应提示(无状态,支持任意次往返)
         const extraMsgs = []
-        if (verdict.purpose === 'chat') {
-          const hasMode = payload.messages.some((m) => m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form === 'mode')
-          if (!hasMode) {
+        {
+          let lastChat = false
+          let hasMode = false
+          for (const m of payload.messages) {
+            if (m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form === 'mode') {
+              hasMode = true
+              const t = Array.isArray(m.content) && m.content[0] && typeof m.content[0].text === 'string' ? m.content[0].text : ''
+              lastChat = t === CHAT_MODE_TEXT
+            }
+          }
+          if (verdict.purpose === 'chat' && !lastChat) {
             extraMsgs.push({
               id: PLUGIN + '-mode-' + agent.id + '-' + (++msgCounter),
               role: 'user',
@@ -2700,7 +2715,16 @@ export class MemoryDbService extends Service {
             })
             bumpStats(wpath, { chatMode: 'injected' })
             debugLog('pre-step: chat-mode prompt injected for ' + agent.id)
-          } else {
+          } else if (verdict.purpose === 'task' && hasMode && lastChat) {
+            extraMsgs.push({
+              id: PLUGIN + '-mode-' + agent.id + '-' + (++msgCounter),
+              role: 'user',
+              content: [{ type: 'text', text: TASK_MODE_TEXT }],
+              source: { kind: 'plugin', plugin: PLUGIN, form: 'mode' },
+            })
+            bumpStats(wpath, { chatMode: 'restored' })
+            debugLog('pre-step: task-mode prompt restored for ' + agent.id)
+          } else if (verdict.purpose === 'chat') {
             bumpStats(wpath, { chatMode: 'present' })
           }
         }
