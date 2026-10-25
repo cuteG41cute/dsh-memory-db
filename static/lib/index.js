@@ -1187,9 +1187,13 @@ export class MemoryDbService extends Service {
     // 派生索引：memory.json 仍是唯一权威数据，index.sqlite 只服务检索，
     // 可随时删除重建；任何环节失败自动回退旧的关键词打分算法。
     let sqliteNS = null
-    import('node:sqlite').then((m) => { sqliteNS = m; debugLog('fts: node:sqlite available') }).catch(() => {})
-    const FTS_HALF_LIFE_DAYS = 14   // 时间衰减半衰期：14 天前的记忆相关性折半
+    const ftsNodeVer = (typeof process !== 'undefined' && process.versions && process.versions.node) || '?'
+    import('node:sqlite').then((m) => { sqliteNS = m; debugLog('fts: node:sqlite available (node ' + ftsNodeVer + ')') }).catch((e) => {
+      debugLog('fts: node:sqlite import FAILED (node ' + ftsNodeVer + '): ' + (e && e.message))
+    })
+    const FTS_HALF_LIFE_DAYS = 30   // 时间衰减半衰期：30 天前的记忆相关性折半（评测后从 14 放宽）
     const FTS_KEEP_RATIO = 0.15     // 相对阈值：得分低于最高分 15% 的条目不注入
+    const FTS_ANSWER_CAP = 4000     // 索引时答案只取前 4000 字符，抑制"超长答案词汇垄断"
 
     // 与 tokenize 同规则，但保留重复项（BM25 需要词频）且单字也保留
     function tokenizeRaw(q) {
@@ -1233,7 +1237,7 @@ export class MemoryDbService extends Service {
         for (const en of db.entries) {
           ins.run(
             tokenizeRaw(en.question).join(' '),
-            tokenizeRaw(en.answer).join(' '),
+            tokenizeRaw(String(en.answer || '').slice(0, FTS_ANSWER_CAP)).join(' '),
             tokenizeRaw(en.sessionTitle || '').join(' '),
             en.id,
           )
@@ -1250,12 +1254,14 @@ export class MemoryDbService extends Service {
         return null
       }
     }
-    // BM25(问题×3, 回答×1, 会话标题×2) × 时间衰减，再按相对阈值过滤弱相关
+    // BM25(问题×6, 回答×1, 会话标题×2) × 时间衰减，再按相对阈值过滤弱相关
+    // 调参依据（离线 A/B 评测 8 用例）：问题侧命中才是"当时真正讨论的事"，
+    // 权重须显著压过词汇量大的长答案；时间衰减放宽到 30 天防新条目垄断
     function ftsSearch(wpath, state, expr, limit) {
       const pdb = ftsEnsure(wpath, state)
       if (!pdb) return null
       try {
-        const rows = pdb.prepare('SELECT eid, bm25(mem, 3.0, 1.0, 2.0) AS r FROM mem WHERE mem MATCH ? ORDER BY r LIMIT ?').all(expr, limit)
+        const rows = pdb.prepare('SELECT eid, bm25(mem, 6.0, 1.0, 2.0) AS r FROM mem WHERE mem MATCH ? ORDER BY r LIMIT ?').all(expr, limit)
         const byId = new Map(state.db.entries.map((en) => [en.id, en]))
         const now = Date.now()
         const out = []
