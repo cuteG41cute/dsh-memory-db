@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-memory-db",
   "version": "0.3.0",
   "description": "DeepSeek Harness static plugin: per-project memory database 鈥?auto-collects Q&A pairs, three-state classifier (recall/continue/shift), keyword retrieval, budgeted memory injection, admin page. Composition-loaded, survives restarts.",
