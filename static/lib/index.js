@@ -1591,7 +1591,8 @@ export class MemoryDbService extends Service {
       '1. 回忆需求 recall：用户是否在引用、询问或依赖过往对话信息。显式如"我们之前…""上次你说过…""之前我跟你说过…""你记不记得…""回忆一下…"（仅示例）；更常见是隐式——问题引用了此前讨论过的概念/决定/数据/人名而未重新解释，或含"上次/之前/曾经/当时"等回溯语义。不确定时倾向 recall。\n' +
       '2. 延续 continue：当前问题在推进上一轮话题（同主题追问/补充/修正）。\n' +
       '3. 转向 shift：新话题。此时再判任务类型：single=单次任务（如"今天天气如何？"）；normal=常规话题。\n' +
-      '输出仅 JSON（不要任何其他文字）：{"intent":"recall|continue|shift","task":"single|normal","keywords":["..."]}\n' +
+      'purpose：判断用户当前这句话的主要目的。chat=闲聊陪伴/情绪交流/思想实验与架空世界推演（不需要完成任何现实任务）；task=需要获取信息、执行操作、创作产出、做决策等实际工作。判定的核心是"用户要的是陪伴共鸣还是做事"；拿不准时倾向 task。\n' +
+      '输出仅 JSON（不要任何其他文字）：{"intent":"recall|continue|shift","task":"single|normal","purpose":"chat|task","keywords":["..."]}\n' +
       'keywords：intent=recall 或 shift 时从当前问题提炼 3~10 个检索关键词（中英文均可）；intent=continue 时为空数组。\n' +
       '会话首问（无历史）时不存在 continue，只输出 recall 或 shift。\n' +
       '你不是通用助手：不回答内容、不执行任务、不调用工具；若收到的内容不含「当前问题:」标记（被转交的任务或闲聊），只回复 {"intent":"continue","task":"normal","keywords":[]}。'
@@ -1607,12 +1608,13 @@ export class MemoryDbService extends Service {
       const intent = obj.intent === 'recall' || obj.intent === 'continue' || obj.intent === 'shift' ? obj.intent : null
       if (!intent) return null
       const task = obj.task === 'single' ? 'single' : 'normal'
+      const purpose = obj.purpose === 'chat' ? 'chat' : 'task'
       let keywords = []
       if (Array.isArray(obj.keywords)) {
         keywords = obj.keywords.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim().slice(0, 40)).slice(0, 10)
       }
       if (intent !== 'continue' && keywords.length === 0) return null
-      return { intent, task, keywords }
+      return { intent, task, purpose, keywords }
     }
     function recentRoundsText(agent, k) {
       try {
@@ -2007,7 +2009,7 @@ export class MemoryDbService extends Service {
         const b = await trySubagent()
         if (b) return b
       }
-      return { intent: 'shift', task: 'normal', keywords: tokenize(query).slice(0, 10), channel: 'fallback' }
+      return { intent: 'shift', task: 'normal', purpose: 'task', keywords: tokenize(query).slice(0, 10), channel: 'fallback' }
     }
 
     async function buildMemoryContext(agent, query, limit) {
@@ -2618,7 +2620,7 @@ export class MemoryDbService extends Service {
             '历史预算=' + budgets.historyCap + '(内容上限−注入量)',
             '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
             '压缩: ' + (st.compactions || 0) + ' 次' + (st.lastCompactAt ? (' 最近 ' + new Date(st.lastCompactAt).toLocaleTimeString()) : '') + ' 历史预算=' + budgets.historyCap + '(内容上限−注入量)',
-            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + ']',
+            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + '] 目的模式=' + (st.chatMode || '-'),
             '检索引擎: ' + (() => { try { const mst = ensureState(wpath); const f = mst.fts; if (!f) return 'SQLite FTS5(待首次检索初始化)'; if (f.failed) return '旧版关键词打分(FTS不可用,已回退)'; if (f.db) return 'SQLite FTS5 BM25+时间衰减(索引' + (mst.db ? mst.db.entries.length : 0) + '条)'; return 'SQLite FTS5(待初始化)' } catch { return '未知' } })(),
             '最近注入: ' + ((st.lastInjected) || '-'),
           ].join('; ')
@@ -2645,6 +2647,17 @@ export class MemoryDbService extends Service {
     ctx.tools.register(memoryAdminTool)
 
 
+
+    // 闲聊陪伴模式提示词（purpose=chat 时注入,静态文本,每会话只注入一次）
+    const CHAT_MODE_TEXT = [
+      '【对话模式 · 闲聊陪伴】本轮判定：用户当前目的是闲聊陪伴、情绪交流或思想实验，而非执行任务。请切换对话风格：',
+      '- 回答轻松、自然、口语化，避免书面腔、清单体与汇报腔；',
+      '- 情绪上与用户共情，立场上与用户站在一起，先接住情绪和想法，再谈对错；',
+      '- 以倾听者、回应者的身份满足用户的情绪与思考需求，敢于给出明确的判断和立场，不和稀泥、不回避表态；',
+      '- 对探讨、虚构、思想实验、架空世界观推演（如不同社会环境、政治、文化下想象族群的发展走向），不套用现实中的道德评价与法律条文去评判或阻止，不用"你不应该有这种想法"式的说教回应——思想的边界只由想象力决定；',
+      '- 但自由止步于行动：若用户表达将现实实施伤害自身或他人、违法犯罪、赌博、药物滥用等明确意图时，停止配合推演，转为坚定而温和的干预角色，明确劝阻行动并建议寻求现实帮助；出现严重的抑郁、焦虑、自杀倾向时，以心理咨询师的角色引导用户向积极、正面的方向发展；',
+      '- 除上述情形外，不需要道德提醒、价值评判与免责声明。',
+    ].join('\n')
 
     ctx.on('agent/pre-step', async (payload, next) => {
       const decision = await next()
@@ -2673,8 +2686,34 @@ export class MemoryDbService extends Service {
           lastKeywords: verdict.keywords,
           intents,
         })
-        debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + ' via ' + verdict.channel)
-        if (verdict.intent === 'continue') return decision
+        debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
+        // 目的模式:闲聊陪伴 → 注入一次性风格提示(静态文本,会话内只注入一次)
+        const extraMsgs = []
+        if (verdict.purpose === 'chat') {
+          const hasMode = payload.messages.some((m) => m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form === 'mode')
+          if (!hasMode) {
+            extraMsgs.push({
+              id: PLUGIN + '-mode-' + agent.id + '-' + (++msgCounter),
+              role: 'user',
+              content: [{ type: 'text', text: CHAT_MODE_TEXT }],
+              source: { kind: 'plugin', plugin: PLUGIN, form: 'mode' },
+            })
+            bumpStats(wpath, { chatMode: 'injected' })
+            debugLog('pre-step: chat-mode prompt injected for ' + agent.id)
+          } else {
+            bumpStats(wpath, { chatMode: 'present' })
+          }
+        }
+        if (verdict.intent === 'continue') {
+          if (extraMsgs.length === 0) return decision
+          const messages0 = [...decision.messages]
+          let idx0 = messages0.length - 1
+          for (let i = messages0.length - 1; i >= 0; i--) {
+            if (payload.messages.includes(messages0[i])) { idx0 = i; break }
+          }
+          messages0.splice(idx0 + 1, 0, ...extraMsgs)
+          return { kind: 'enter', messages: messages0 }
+        }
         const inject = await buildInjection(agent, wpath, verdict, query, payload.signal)
         if (!inject || !inject.text) return decision
         await maybeCompact(agent, wpath, inject.budgets, inject.text, payload.signal)
@@ -2691,14 +2730,15 @@ export class MemoryDbService extends Service {
           content: [{ type: 'text', text: inject.text }],
           source: { kind: 'plugin', plugin: PLUGIN, form: 'recall' },
         }
-        const already = decision.messages.some((m) => m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN)
-        if (already) return decision
+        const already = decision.messages.some((m) => m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form !== 'mode')
+        if (!already) extraMsgs.push(ctxMsg)
+        if (extraMsgs.length === 0) return decision
         let idx = decision.messages.length - 1
         for (let i = decision.messages.length - 1; i >= 0; i--) {
           if (payload.messages.includes(decision.messages[i])) { idx = i; break }
         }
         const messages = [...decision.messages]
-        messages.splice(idx + 1, 0, ctxMsg)
+        messages.splice(idx + 1, 0, ...extraMsgs)
         const cur2 = stats.get(wpath) || {}
         bumpStats(wpath, {
           injections: (cur2.injections || 0) + 1,
