@@ -806,6 +806,7 @@ export class MemoryDbService extends Service {
       try {
         if (fs) {
           const target = await fs.resolve(joinPath(wpath, DB_REL))
+          state.dbPath = target
           const info = await fs.stat(target)
           if (info) {
             const raw = await fs.readText(target)
@@ -828,6 +829,7 @@ export class MemoryDbService extends Service {
     }
     function queueSave(wpath) {
       const state = ensureState(wpath)
+      state.rev = (state.rev || 0) + 1
       state.writeChain = state.writeChain.then(async () => {
         if (!fs || !state.db) return
         const target = await fs.resolve(joinPath(wpath, DB_REL))
@@ -1159,7 +1161,7 @@ export class MemoryDbService extends Service {
       if (tokens.length === 0) tokens.push(s)
       return [...new Set(tokens)]
     }
-    function searchEntriesScored(entries, query) {
+    function searchEntriesLegacy(entries, query) {
       const tokens = tokenize(query)
       if (tokens.length === 0) return []
       const scored = []
@@ -1176,16 +1178,132 @@ export class MemoryDbService extends Service {
       scored.sort((a, b) => b.score - a.score || (b.en.time || 0) - (a.en.time || 0))
       return scored
     }
-    function searchEntries(entries, query, limit) {
-      const scored = searchEntriesScored(entries, query)
+    function searchEntries(entries, query, limit, state, wpath) {
+      const scored = searchEntriesScored(entries, query, state, wpath)
       return scored.slice(0, limit > 0 ? limit : scored.length).map((s) => s.en)
     }
 
+    // ---- SQLite FTS5 BM25 检索层（v0.3.0）----
+    // 派生索引：memory.json 仍是唯一权威数据，index.sqlite 只服务检索，
+    // 可随时删除重建；任何环节失败自动回退旧的关键词打分算法。
+    let sqliteNS = null
+    import('node:sqlite').then((m) => { sqliteNS = m; debugLog('fts: node:sqlite available') }).catch(() => {})
+    const FTS_HALF_LIFE_DAYS = 14   // 时间衰减半衰期：14 天前的记忆相关性折半
+    const FTS_KEEP_RATIO = 0.15     // 相对阈值：得分低于最高分 15% 的条目不注入
+
+    // 与 tokenize 同规则，但保留重复项（BM25 需要词频）且单字也保留
+    function tokenizeRaw(q) {
+      const s = String(q).toLowerCase().trim()
+      if (!s) return []
+      const tokens = []
+      for (const m of s.matchAll(/[a-z0-9]+/g)) if (m[0].length >= 2) tokens.push(m[0])
+      for (const m of s.matchAll(/[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+/g)) {
+        const run = m[0]
+        if (run.length >= 2) for (let i = 0; i < run.length - 1; i++) tokens.push(run.slice(i, i + 2))
+        else tokens.push(run)
+      }
+      if (tokens.length === 0 && s) tokens.push(s)
+      return tokens
+    }
+    function ftsQuote(tok) { return '"' + String(tok).replace(/"/g, '""') + '"' }
+
+    function ftsStateOf(state) {
+      if (!state.fts) state.fts = { db: null, stamp: '', failed: false }
+      return state.fts
+    }
+    // 打开（或校验/重建）索引；返回可用的 DatabaseSync 或 null（回退）
+    function ftsEnsure(wpath, state) {
+      const f = ftsStateOf(state)
+      if (!sqliteNS || !state.db || f.failed) return null
+      const db = state.db
+      const stamp = db.entries.length + '|' + (db.entries.length ? db.entries[db.entries.length - 1].id : '') + '|' + (state.rev || 0)
+      if (f.db && f.stamp === stamp) return f.db
+      try {
+        if (!f.db) {
+          const p = String(state.dbPath || '')
+          const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+          if (cut <= 0) { f.failed = true; return null }
+          const pdb = new sqliteNS.DatabaseSync(p.slice(0, cut + 1) + 'index.sqlite')
+          pdb.exec("PRAGMA journal_mode=WAL; CREATE VIRTUAL TABLE IF NOT EXISTS mem USING fts5(q, a, s, eid UNINDEXED, tokenize='unicode61');")
+          f.db = pdb
+        }
+        const t0 = Date.now()
+        f.db.exec('BEGIN; DELETE FROM mem;')
+        const ins = f.db.prepare('INSERT INTO mem(q, a, s, eid) VALUES (?, ?, ?, ?)')
+        for (const en of db.entries) {
+          ins.run(
+            tokenizeRaw(en.question).join(' '),
+            tokenizeRaw(en.answer).join(' '),
+            tokenizeRaw(en.sessionTitle || '').join(' '),
+            en.id,
+          )
+        }
+        f.db.exec('COMMIT;')
+        f.stamp = stamp
+        if (db.entries.length > 0) debugLog('fts: index rebuilt (' + db.entries.length + ' entries, ' + (Date.now() - t0) + 'ms)')
+        return f.db
+      } catch (e) {
+        f.failed = true
+        try { if (f.db) f.db.close() } catch { /* ignore */ }
+        f.db = null
+        debugLog('fts unavailable, legacy fallback: ' + (e && e.message))
+        return null
+      }
+    }
+    // BM25(问题×3, 回答×1, 会话标题×2) × 时间衰减，再按相对阈值过滤弱相关
+    function ftsSearch(wpath, state, expr, limit) {
+      const pdb = ftsEnsure(wpath, state)
+      if (!pdb) return null
+      try {
+        const rows = pdb.prepare('SELECT eid, bm25(mem, 3.0, 1.0, 2.0) AS r FROM mem WHERE mem MATCH ? ORDER BY r LIMIT ?').all(expr, limit)
+        const byId = new Map(state.db.entries.map((en) => [en.id, en]))
+        const now = Date.now()
+        const out = []
+        for (const row of rows) {
+          const en = byId.get(String(row.eid))
+          if (!en) continue
+          const ageDays = Math.max(0, (now - (en.time || now)) / 86400000)
+          const decay = Math.pow(0.5, ageDays / FTS_HALF_LIFE_DAYS)
+          const raw = -Number(row.r)
+          if (raw <= 0) continue
+          out.push({ en, score: raw * decay, raw })
+        }
+        if (out.length === 0) return []
+        out.sort((a, b) => b.score - a.score || (b.en.time || 0) - (a.en.time || 0))
+        const cut = Math.max(out[0].score * FTS_KEEP_RATIO, 1e-9)
+        return out.filter((o) => o.score >= cut)
+      } catch (e) {
+        debugLog('fts search failed, legacy fallback: ' + (e && e.message))
+        return null
+      }
+    }
+
+    function searchEntriesScored(entries, query, state, wpath) {
+      const tokens = tokenize(query)
+      if (tokens.length === 0) return []
+      if (state && wpath) {
+        const hits = ftsSearch(wpath, state, tokens.map(ftsQuote).join(' OR '), 200)
+        if (hits) return hits
+      }
+      return searchEntriesLegacy(entries, query)
+    }
 
     // ---- pkg-29 关键词直接匹配检索 + 记忆资料构造 ----
-    function searchByKeywords(entries, keywords) {
+    function searchByKeywords(entries, keywords, state, wpath) {
       const kws = (keywords || []).filter((k) => typeof k === "string" && k.trim()).map((k) => k.trim().toLowerCase())
       if (kws.length === 0) return []
+      if (state && wpath) {
+        // 每个关键词按原始词序做短语匹配（中文经二元组化后短语可精确还原），OR 并集
+        const expr = kws.map((k) => tokenizeRaw(k).map(ftsQuote).join(' ')).filter((p) => p).map((p) => '(' + p + ')').join(' OR ')
+        if (expr) {
+          const hits = ftsSearch(wpath, state, expr, 200)
+          if (hits) {
+            // BM25×衰减 已含相关度排序；关键词路径沿用时间新→旧的习惯排序语义
+            hits.sort((a, b) => b.score - a.score || (b.en.time || 0) - (a.en.time || 0))
+            return hits.map((h) => h.en)
+          }
+        }
+      }
       const hits = []
       for (const en of entries) {
         const ql = String(en.question || "").toLowerCase()
@@ -1325,7 +1443,7 @@ export class MemoryDbService extends Service {
       const state = ensureState(wpath)
       await loadDb(wpath)
       const keywords = verdict.keywords && verdict.keywords.length > 0 ? verdict.keywords : tokenize(query).slice(0, 10)
-      const allHits = searchByKeywords(state.db.entries, keywords)
+      const allHits = searchByKeywords(state.db.entries, keywords, state, wpath)
       // 同会话过滤:本会话自己的历史已在上下文里,再注入一遍纯属浪费
       const curSid = agent && agent.session && agent.session.header ? agent.session.header.id : undefined
       const hits = curSid ? allHits.filter((h) => h.sessionId !== curSid) : allHits
@@ -1893,7 +2011,7 @@ export class MemoryDbService extends Service {
       if (!(await isEnabledFresh(wpath))) return null
       const state = ensureState(wpath)
       await loadDb(wpath)
-      const hits = searchEntries(state.db.entries, query, limit)
+      const hits = searchEntries(state.db.entries, query, limit, state, wpath)
       if (hits.length === 0) return null
       addSurfaced(agent.session.header.id, 'memory', hits.map((h) => h.question + '\n' + h.answer))
       const lines = []
@@ -1955,7 +2073,7 @@ export class MemoryDbService extends Service {
         await loadDb(ws.path)
         const entries = state.db ? state.db.entries : []
         const scored = query && query.trim() !== ''
-          ? searchEntriesScored(entries, query)
+          ? searchEntriesScored(entries, query, state, ws.path)
           : entries.map((en) => ({ en, score: 0 }))
         for (const s of scored) {
           const t = s.en.time || 0
@@ -2417,7 +2535,7 @@ export class MemoryDbService extends Service {
         const kw = typeof args.keywords === 'string' ? args.keywords : ''
         const limit = clampInt(args.limit, 1, 50, 20)
         const kws = kw.split(/[,，;；、\s]+/).filter(Boolean).slice(0, 10)
-        const hits = searchByKeywords(state.db.entries, kws)
+        const hits = searchByKeywords(state.db.entries, kws, state, wpath)
         addSurfaced(agent.session.header.id, 'memory', hits.map((h) => h.question + '\n' + h.answer))
         return {
           enabled: true,
@@ -2495,6 +2613,7 @@ export class MemoryDbService extends Service {
             '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
             '压缩: ' + (st.compactions || 0) + ' 次' + (st.lastCompactAt ? (' 最近 ' + new Date(st.lastCompactAt).toLocaleTimeString()) : '') + ' 历史预算=' + budgets.historyCap + '(内容上限−注入量)',
             '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + ']',
+            '检索引擎: ' + (() => { try { const mst = ensureState(wpath); const f = mst.fts; if (!f) return 'SQLite FTS5(待首次检索初始化)'; if (f.failed) return '旧版关键词打分(FTS不可用,已回退)'; if (f.db) return 'SQLite FTS5 BM25+时间衰减(索引' + (mst.db ? mst.db.entries.length : 0) + '条)'; return 'SQLite FTS5(待初始化)' } catch { return '未知' } })(),
             '最近注入: ' + ((st.lastInjected) || '-'),
           ].join('; ')
           const source = await enabledSource(wpath)
