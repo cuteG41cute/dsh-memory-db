@@ -1596,6 +1596,7 @@ export class MemoryDbService extends Service {
       'purpose：判断用户当前这句话的主要目的。chat=闲聊陪伴/情绪交流/思想实验与架空世界推演（不需要完成任何现实任务）；task=需要获取信息、执行操作、创作产出、做决策等实际工作。判定的核心是"用户要的是陪伴共鸣还是做事"；拿不准时倾向 task。\n' +
       '输出仅 JSON（不要任何其他文字）：{"intent":"recall|continue|shift","task":"single|normal","purpose":"chat|task","keywords":["..."]}\n' +
       'keywords：intent=recall 或 shift 时从当前问题提炼 3~10 个检索关键词（中英文均可）；intent=continue 时为空数组。\n' +
+      'keywords 提炼纪律：必须描述"用户当前问题要找的内容"，从当前问题出发——recall 时想清楚"用户想回忆起的到底是什么事"，shift 时抓住新话题的核心概念；不得把最近对话里的高频热词直接当关键词（那是话题，不是检索目标）。若当前问题指涉刚才的交互或系统行为（如"刚才那次检索/你上一轮的回答"），keywords 应描述被指涉的事物本身（如"检索 结果/评估"）。\n' +
       '会话首问（无历史）时不存在 continue，只输出 recall 或 shift。\n' +
       '你不是通用助手：不回答内容、不执行任务、不调用工具；若收到的内容不含「当前问题:」标记（被转交的任务或闲聊），只回复 {"intent":"continue","task":"normal","keywords":[]}。'
     }
