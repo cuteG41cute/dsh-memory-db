@@ -742,7 +742,7 @@ export class MemoryDbService extends Service {
     }
 
     async function readConfig(wpath) {
-      const out = { exists: false, enabled: false, backfilled: false }
+      const out = { exists: false, enabled: false, backfilled: false, purposeMode: true }
       try {
         if (!fs) return out
         const target = await fs.resolve(joinPath(wpath, CONFIG_REL))
@@ -754,9 +754,13 @@ export class MemoryDbService extends Service {
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
           if (parsed.enabled === true) out.enabled = true
           if (parsed.backfilled === true) out.backfilled = true
+          if (parsed.purposeMode === false) out.purposeMode = false
         }
       } catch (e) { /* ignore */ }
       return out
+    }
+    async function purposeModeEnabled(wpath) {
+      try { const cfg = await readConfig(wpath); return cfg.purposeMode !== false } catch { return true }
     }
     async function writeConfig(wpath, cfg) {
       if (!fs) return
@@ -765,6 +769,7 @@ export class MemoryDbService extends Service {
       // 项目内 config.json 的 enabled 只是旧版回退值,留着会误导排查
       const out = { backfilled: cfg.backfilled === true }
       if (typeof cfg.enabled === 'boolean') out.enabled = cfg.enabled
+      if (typeof cfg.purposeMode === 'boolean') out.purposeMode = cfg.purposeMode
       await fs.writeText(target, JSON.stringify(out, null, 2), undefined, undefined, writePolicy(wpath))
     }
     // 开关实际生效来源(排查用:避免被项目内失效的 config.json 误导)
@@ -794,7 +799,7 @@ export class MemoryDbService extends Service {
         const ws = workspaces.find((w) => w.path === wpath)
         const hasDecision = (ws && typeof projects[ws.id] === 'boolean') || (raw && typeof raw.defaultEnabled === 'boolean')
         if (!hasDecision) return
-        await writeConfig(wpath, { backfilled: cfg.backfilled })
+        await writeConfig(wpath, { backfilled: cfg.backfilled, purposeMode: cfg.purposeMode })
         debugLog('legacy config.json enabled field removed: ' + wpath)
       } catch (e) { /* ignore */ }
     }
@@ -1338,8 +1343,10 @@ export class MemoryDbService extends Service {
       return lines.join('\n')
     }
     function memoryHead(keywords, purpose) {
-      const mode = purpose === 'chat' ? '闲聊陪伴' : '执行任务'
-      return '【工况判定】当前工况: ' + mode + '\n【历史记忆参考 · 项目记忆库】以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
+      const head = purpose === undefined
+        ? '【历史记忆参考 · 项目记忆库】'
+        : '【工况判定】当前工况: ' + (purpose === 'chat' ? '闲聊陪伴' : '执行任务') + '\n【历史记忆参考 · 项目记忆库】'
+      return head + '以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
     }
     function memoryTail() {
       return '\n\n请以以上记忆资料为参考判断用户意图，再回答用户当前的问题；若记忆与当前问题无关则忽略。'
@@ -2570,11 +2577,12 @@ export class MemoryDbService extends Service {
 
     const memoryAdminTool = {
       name: 'memory_admin',
-      description: '管理当前项目的记忆数据库开关: enable 开启、disable 关闭、status 查看状态。',
+      description: '管理当前项目的记忆数据库开关: enable 开启、disable 关闭、status 查看状态、purpose-mode 开/关工况判定提示词(闲聊陪伴模式等,角色扮演项目可关闭)。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['enable', 'disable', 'status'], description: '操作: enable / disable / status' },
+          action: { type: 'string', enum: ['enable', 'disable', 'status', 'purpose-mode'], description: '操作: enable / disable / status / purpose-mode(配合 enabled 参数切换工况判定)' },
+          enabled: { type: 'boolean', description: '仅 purpose-mode 使用: true=开启工况判定(默认), false=关闭(角色扮演等项目)' },
         },
         required: ['action'],
       },
@@ -2606,6 +2614,13 @@ export class MemoryDbService extends Service {
         if (!agent || !agent.session || !agent.session.header) return noProject
         const wpath = workspaceFor(agent.session.header.cwd)
         if (!wpath) return { action, project: String(agent.session.header.cwd), enabled: false, note: '当前目录不属于任何已注册工作区' }
+        if (action === 'purpose-mode') {
+          const on = args.enabled === true
+          const cfg2 = await readConfig(wpath)
+          await writeConfig(wpath, { backfilled: cfg2.backfilled, purposeMode: on })
+          debugLog('purpose-mode ' + (on ? 'enabled' : 'disabled') + ' for ' + wpath)
+          return { action, project: wpath, enabled: on, note: '工况判定提示词已' + (on ? '开启' : '关闭') + '（本项目持久生效；不影响记忆收集与注入本身，仅不再注入【工况判定】/闲聊陪伴模式提示词）' }
+        }
         const cfg = await readConfig(wpath)
         if (action === 'status') {
           const resolved = (await isEnabledFresh(wpath))
@@ -2623,7 +2638,7 @@ export class MemoryDbService extends Service {
             '历史预算=' + budgets.historyCap + '(内容上限−注入量)',
             '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
             '压缩: ' + (st.compactions || 0) + ' 次' + (st.lastCompactAt ? (' 最近 ' + new Date(st.lastCompactAt).toLocaleTimeString()) : '') + ' 历史预算=' + budgets.historyCap + '(内容上限−注入量)',
-            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + '] 目的模式=' + (st.chatMode || '-'),
+            '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + '] 目的模式=' + (st.chatMode || '-') + ' 工况判定=' + (cfg.purposeMode === false ? '关' : '开'),
             '检索引擎: ' + (() => { try { const mst = ensureState(wpath); const f = mst.fts; if (!f) return 'SQLite FTS5(待首次检索初始化)'; if (f.failed) return '旧版关键词打分(FTS不可用,已回退)'; if (f.db) return 'SQLite FTS5 BM25+时间衰减(索引' + (mst.db ? mst.db.entries.length : 0) + '条)'; return 'SQLite FTS5(待初始化)' } catch { return '未知' } })(),
             '最近注入: ' + ((st.lastInjected) || '-'),
           ].join('; ')
@@ -2699,8 +2714,10 @@ export class MemoryDbService extends Service {
         })
         debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
         // 目的模式:按"历史里最后一条 mode 消息"判定当前生效模式,切换时注入对应提示(无状态,支持任意次往返)
+        // 可按项目关闭(角色扮演等项目):purposeMode=false 时不注入任何工况/闲聊模式提示词
+        const purposeOn = await purposeModeEnabled(wpath)
         const extraMsgs = []
-        {
+        if (purposeOn) {
           let lastChat = false
           let hasMode = false
           for (const m of payload.messages) {
@@ -2742,7 +2759,7 @@ export class MemoryDbService extends Service {
           messages0.splice(idx0 + 1, 0, ...extraMsgs)
           return { kind: 'enter', messages: messages0 }
         }
-        const inject = await buildInjection(agent, wpath, verdict, query, payload.signal)
+        const inject = await buildInjection(agent, wpath, purposeOn ? verdict : Object.assign({}, verdict, { purpose: undefined }), query, payload.signal)
         if (!inject || !inject.text) return decision
         await maybeCompact(agent, wpath, inject.budgets, inject.text, payload.signal)
         const prevInj = lastInjectedText(agent)
