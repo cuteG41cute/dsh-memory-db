@@ -299,7 +299,7 @@ window.__ModuleLoader__.load({
                 }) : [
                   react.createElement('div', { key: 'empty', style: { color: 'var(--dsw-alias-label-caption, #b0b0b0)' } }, '暂无判定记录——发一条消息后，分类器的判定过程会显示在这里'),
                 ]),
-                react.createElement('div', { key: 'i3' }, '注入 ' + (panel.injections || 0) + ' 次 · 检索: ' + (panel.engine || '未知')),
+                react.createElement('div', { key: 'i3' }, '注入 ' + (panel.injections || 0) + ' 次 · 检索: ' + (panel.engine || '未知') + ' · 分类: ' + (panel.classifierMode === 'subagent' ? '子代理' : '内联')),
               ] : [
                 react.createElement('div', { key: 'loading' }, '加载中…'),
               ]),

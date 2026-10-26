@@ -502,6 +502,8 @@ export class MemoryDbService extends Service {
     const CONFIG_REL = '.dsh/memory-db/config.json'
     const DB_REL = '.dsh/memory-db/memory.json'
     const VERDICT_REL = '.dsh/memory-db/verdicts.json'
+    // 分类器累积上下文(持久化):保证前缀跨重启/跨压缩逐字节稳定 → 持续命中 provider 前缀缓存
+    const CLASSIFY_CTX_REL = '.dsh/memory-db/classify-ctx.json'
     const DEBUG_REL = '.dsh/memory-db/debug.log'
     const KEY_DEFAULT = '__default__'
     const DEFAULT_ENABLED = false
@@ -551,8 +553,6 @@ export class MemoryDbService extends Service {
     const stats = new Map()
 
     const classifierBySession = new Map()
-    // 分类器输入的累积起点(按会话):保持前缀稳定以命中 provider 缓存
-    const classifyWindow = new Map()
     // 已弃用的分类器 id（不可用或被污染）——不再复用，强制新建
     const classifierBlacklist = new Set()
     const classifierChildIds = new Set()
@@ -764,12 +764,20 @@ export class MemoryDbService extends Service {
           if (parsed.enabled === true) out.enabled = true
           if (parsed.backfilled === true) out.backfilled = true
           if (parsed.purposeMode === false) out.purposeMode = false
+          if (parsed.classifierMode === 'subagent' || parsed.classifierMode === 'inline') out.classifierMode = parsed.classifierMode
         }
       } catch (e) { /* ignore */ }
       return out
     }
     async function purposeModeEnabled(wpath) {
       try { const cfg = await readConfig(wpath); return cfg.purposeMode !== false } catch { return true }
+    }
+    // 分类通道:每项目可切 inline / subagent(便于实测成本与判定质量)
+    async function classifierModeFor(wpath) {
+      try {
+        const cfg = await readConfig(wpath)
+        return cfg.classifierMode === 'subagent' ? 'subagent' : 'inline'
+      } catch { return 'inline' }
     }
     async function writeConfig(wpath, cfg) {
       if (!fs) return
@@ -779,6 +787,7 @@ export class MemoryDbService extends Service {
       const out = { backfilled: cfg.backfilled === true }
       if (typeof cfg.enabled === 'boolean') out.enabled = cfg.enabled
       if (typeof cfg.purposeMode === 'boolean') out.purposeMode = cfg.purposeMode
+      if (cfg.classifierMode === 'inline' || cfg.classifierMode === 'subagent') out.classifierMode = cfg.classifierMode
       await fs.writeText(target, JSON.stringify(out, null, 2), undefined, undefined, writePolicy(wpath))
     }
     // 开关实际生效来源(排查用:避免被项目内失效的 config.json 误导)
@@ -808,7 +817,7 @@ export class MemoryDbService extends Service {
         const ws = workspaces.find((w) => w.path === wpath)
         const hasDecision = (ws && typeof projects[ws.id] === 'boolean') || (raw && typeof raw.defaultEnabled === 'boolean')
         if (!hasDecision) return
-        await writeConfig(wpath, { backfilled: cfg.backfilled, purposeMode: cfg.purposeMode })
+        await writeConfig(wpath, { backfilled: cfg.backfilled, purposeMode: cfg.purposeMode, classifierMode: cfg.classifierMode })
         debugLog('legacy config.json enabled field removed: ' + wpath)
       } catch (e) { /* ignore */ }
     }
@@ -1667,11 +1676,12 @@ export class MemoryDbService extends Service {
       if (intent !== 'continue' && keywords.length === 0) return null
       return { intent, task, purpose, keywords }
     }
-    function recentRoundsText(agent, k, currentQuery) {
+    // 从会话日志收集"已完成的问答轮次"(只含拿到助手回复的轮次)
+    function completedRounds(agent) {
       try {
         const session = agent && agent.session
         const events = session && session.events
-        if (!events || typeof events.entries !== 'function') return ''
+        if (!events || typeof events.entries !== 'function') return []
         const rounds = []
         let cur = null
         for (const [, ev] of events.entries()) {
@@ -1690,36 +1700,59 @@ export class MemoryDbService extends Service {
             }
           }
         }
-        const qn = String(currentQuery || '').trim()
-        // 当前问题会单独成块给出,这里去掉它,避免重复占用输入
-        const list = (qn && rounds.length > 0 && !rounds[rounds.length - 1].a && rounds[rounds.length - 1].q.trim() === qn)
-          ? rounds.slice(0, -1)
-          : rounds
-        if (list.length === 0) return ''
-        // 缓存友好:固定起点累积(而非每轮滑动窗口)——第 N+1 轮输入 = 第 N 轮的完整前缀 + 新增轮次,
-        // 保证 system + 历史逐字节连续 → 命中 provider 前缀缓存(命中价约为未命中的 1/20~1/30)。
-        // 累积超过字符上限时才整体重置一次(从最近 k 轮重新开始),此后继续累积。
-        const sid = session && session.header ? session.header.id : ''
-        const win = classifyWindow.get(sid) || { start: 0 }
-        const blockOf = (r) => '用户: ' + r.q + (r.a ? '\n助手: ' + r.a : '')
-        let start = Math.max(0, Math.min(win.start, list.length - 1))
-        let total = 0
-        for (let i = start; i < list.length; i++) total += blockOf(list[i]).length
-        if (total > CLASSIFY_INPUT_MAX_CHARS) {
-          // 重置点:只保留最近 k 轮,下一次判定从这里重新累积
-          start = Math.max(0, list.length - k)
-          total = 0
-          for (let i = start; i < list.length; i++) total += blockOf(list[i]).length
-          debugLog('classify window reset: keep last ' + (list.length - start) + ' rounds (' + total + ' chars)')
+        return rounds.filter((r) => r.a)
+      } catch (e) { return [] }
+    }
+    function roundBlock(r) { return '用户: ' + r.q + '\n助手: ' + r.a }
+    // 分类器累积上下文:落盘保存,重启/压缩后前缀仍逐字节一致 → 继续命中 provider 缓存
+    async function loadClassifyCtx(wpath) {
+      const state = ensureState(wpath)
+      if (state.classifyCtx) return state.classifyCtx
+      let ctx = { text: '', count: 0 }
+      try {
+        if (fs) {
+          const p = await fs.resolve(joinPath(wpath, CLASSIFY_CTX_REL))
+          const info = await fs.stat(p)
+          if (info) {
+            const parsed = JSON.parse(await fs.readText(p))
+            if (parsed && typeof parsed.text === 'string') ctx = { text: parsed.text, count: Number(parsed.count) || 0 }
+          }
         }
-        win.start = start
-        classifyWindow.set(sid, win)
-        const picked = []
-        for (let i = start; i < list.length; i++) picked.push(blockOf(list[i]))
-        return picked.join('\n')
-      } catch (e) {
-        return ''
+      } catch (e) { /* 首次或损坏时从空开始 */ }
+      state.classifyCtx = ctx
+      return ctx
+    }
+    function queueSaveClassifyCtx(wpath) {
+      const state = ensureState(wpath)
+      const ctx = state.classifyCtx
+      if (!ctx) return
+      const snapshot = JSON.stringify({ text: ctx.text, count: ctx.count, at: Date.now() })
+      if (state.classifyCtxSaved === snapshot) return
+      state.classifyCtxChain = (state.classifyCtxChain || Promise.resolve()).then(async () => {
+        if (!fs) return
+        const p = await fs.resolve(joinPath(wpath, CLASSIFY_CTX_REL))
+        await fs.writeText(p, snapshot, undefined, undefined, writePolicy(wpath))
+        state.classifyCtxSaved = snapshot
+      }).catch((e) => { debugLog('classify-ctx save failed: ' + (e && e.message)) })
+    }
+    // 返回分类器的"历史部分"文本:从固定起点累积,新轮次追加到末尾(前缀稳定)
+    async function classifyHistoryText(agent, wpath, k) {
+      const ctx = await loadClassifyCtx(wpath)
+      const rounds = completedRounds(agent)
+      if (rounds.length > ctx.count) {
+        const fresh = rounds.slice(ctx.count)
+        for (const r of fresh) ctx.text += (ctx.text ? '\n' : '') + roundBlock(r)
+        ctx.count = rounds.length
+        // 超过上限才整体重置一次(只保留最近 k 轮),此后继续累积
+        if (ctx.text.length > CLASSIFY_INPUT_MAX_CHARS) {
+          const keep = rounds.slice(-k)
+          ctx.text = keep.map(roundBlock).join('\n')
+          ctx.count = rounds.length
+          debugLog('classify ctx reset: keep last ' + keep.length + ' rounds (' + ctx.text.length + ' chars)')
+        }
+        queueSaveClassifyCtx(wpath)
       }
+      return ctx.text
     }
     function hasPreviousUser(agent) {
       try {
@@ -2098,8 +2131,8 @@ export class MemoryDbService extends Service {
       if (second) debugLog('classifier A empty(no-effort): kinds=' + JSON.stringify(second.kinds) + ' finish=' + second.finishReason + ' usage=' + JSON.stringify(second.usage))
       return null
     }
-    async function decideAndKeywords(agent, query, signal) {
-      const recent = recentRoundsText(agent, CLASSIFY_ROUNDS, query)
+    async function decideAndKeywords(agent, query, signal, mode, wpath) {
+      const recent = wpath ? await classifyHistoryText(agent, wpath, CLASSIFY_ROUNDS) : ''
       const isFirst = !hasPreviousUser(agent)
       const pending = pendingUserRounds(agent, query)
       const input = buildClassifierInput(query, recent, isFirst, pending)
@@ -2139,7 +2172,8 @@ export class MemoryDbService extends Service {
         return null
       }
       // 默认 inline:不创建子代理 → 不产生 runtime 完成通知 → 不额外唤醒父会话
-      if (CLASSIFIER_MODE === 'subagent') {
+      const useSubagent = mode === 'subagent' || (mode === undefined && CLASSIFIER_MODE === 'subagent')
+      if (useSubagent) {
         const b = await trySubagent()
         if (b) return b
         const a = await tryInline()
@@ -2618,6 +2652,7 @@ export class MemoryDbService extends Service {
           return {
             ok: true, workspaceId: ws ? ws.id : null, title,
             enabled, purposeMode: cfg.purposeMode !== false,
+            classifierMode: cfg.classifierMode === 'subagent' ? 'subagent' : 'inline',
             count, dbBytes,
             lastDecision: st.lastDecision || null, lastChannel: st.lastChannel || null,
             injections: st.injections || 0, engine,
@@ -2769,12 +2804,13 @@ export class MemoryDbService extends Service {
 
     const memoryAdminTool = {
       name: 'memory_admin',
-      description: '管理当前项目的记忆数据库开关: enable 开启、disable 关闭、status 查看状态、purpose-mode 开/关工况判定提示词(闲聊陪伴模式等,角色扮演项目可关闭)。',
+      description: '管理当前项目的记忆数据库开关: enable 开启、disable 关闭、status 查看状态、purpose-mode 开/关工况判定提示词(闲聊陪伴模式等,角色扮演项目可关闭)、classifier-mode 切换分类通道(inline/subagent)。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['enable', 'disable', 'status', 'purpose-mode'], description: '操作: enable / disable / status / purpose-mode(配合 enabled 参数切换工况判定)' },
+          action: { type: 'string', enum: ['enable', 'disable', 'status', 'purpose-mode', 'classifier-mode'], description: '操作: enable / disable / status / purpose-mode / classifier-mode' },
           enabled: { type: 'boolean', description: '仅 purpose-mode 使用: true=开启工况判定(默认), false=关闭(角色扮演等项目)' },
+          mode: { type: 'string', enum: ['inline', 'subagent'], description: '仅 classifier-mode 使用: inline=内联调用(默认,无通知), subagent=常驻子代理(上下文累积、缓存友好,但判定结算会产生通知)' },
         },
         required: ['action'],
       },
@@ -2800,7 +2836,8 @@ export class MemoryDbService extends Service {
       },
       async execute(args, exec) {
         exec.signal.throwIfAborted()
-        const action = args.action === 'enable' || args.action === 'disable' ? args.action : 'status'
+        const ALLOWED = ['enable', 'disable', 'status', 'purpose-mode', 'classifier-mode']
+        const action = ALLOWED.indexOf(args.action) >= 0 ? args.action : 'status'
         const agent = exec.agent
         const noProject = { action, project: '', enabled: false, note: '无法确定当前项目(未找到所属工作区)' }
         if (!agent || !agent.session || !agent.session.header) return noProject
@@ -2809,9 +2846,21 @@ export class MemoryDbService extends Service {
         if (action === 'purpose-mode') {
           const on = args.enabled === true
           const cfg2 = await readConfig(wpath)
-          await writeConfig(wpath, { backfilled: cfg2.backfilled, purposeMode: on })
+          await writeConfig(wpath, { backfilled: cfg2.backfilled, purposeMode: on, classifierMode: cfg2.classifierMode })
           debugLog('purpose-mode ' + (on ? 'enabled' : 'disabled') + ' for ' + wpath)
           return { action, project: wpath, enabled: on, note: '工况判定提示词已' + (on ? '开启' : '关闭') + '（本项目持久生效；不影响记忆收集与注入本身，仅不再注入【工况判定】/闲聊陪伴模式提示词）' }
+        }
+        if (action === 'classifier-mode') {
+          const m = args.mode === 'subagent' ? 'subagent' : 'inline'
+          const cfg2 = await readConfig(wpath)
+          await writeConfig(wpath, { backfilled: cfg2.backfilled, purposeMode: cfg2.purposeMode, classifierMode: m })
+          debugLog('classifier-mode ' + m + ' for ' + wpath)
+          return {
+            action, project: wpath, enabled: m === 'subagent',
+            note: '分类通道已设为 ' + m + (m === 'subagent'
+              ? '：常驻分类子代理。判定上下文天然累积、缓存友好；代价是每次判定结算会产生一条 runtime 通知，可能唤醒父会话跑一次额外回合。'
+              : '：内联调用。无任何侧效应；输入按固定起点累积，前缀逐字节连续，同样命中 provider 前缀缓存。'),
+          }
         }
         const cfg = await readConfig(wpath)
         if (action === 'status') {
@@ -2828,7 +2877,7 @@ export class MemoryDbService extends Service {
             '标准注入上限=' + budgets.injectCap + '(20%∩可用)',
             '轻量注入上限=' + lightCap + '(5%∩可用)',
             '历史预算=' + budgets.historyCap + '(内容上限−注入量)',
-            '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
+            '分类通道: 模式=' + (cfg.classifierMode === 'subagent' ? 'subagent(项目配置)' : 'inline(项目配置/默认)') + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
             '压缩: ' + (st.compactions || 0) + ' 次' + (st.lastCompactAt ? (' 最近 ' + new Date(st.lastCompactAt).toLocaleTimeString()) : '') + ' 历史预算=' + budgets.historyCap + '(内容上限−注入量)',
             '统计: 注入' + (st.injections || 0) + ' 去重' + (st.dedupeHits || 0) + ' 同会话过滤' + (st.sameSessionSkipped || 0) + ' 判定[' + intentText + '] 目的模式=' + (st.chatMode || '-') + ' 工况判定=' + (cfg.purposeMode === false ? '关' : '开'),
             '检索引擎: ' + (() => { try { const mst = ensureState(wpath); const f = mst.fts; if (!f) return 'SQLite FTS5(待首次检索初始化)'; if (f.failed) return '旧版关键词打分(FTS不可用,已回退)'; if (f.db) return 'SQLite FTS5 BM25+时间衰减(索引' + (mst.db ? mst.db.entries.length : 0) + '条)'; return 'SQLite FTS5(待初始化)' } catch { return '未知' } })(),
@@ -2894,7 +2943,8 @@ export class MemoryDbService extends Service {
         // 日志根目录跟随最近活跃会话的项目(定时器回调里拿不到 initiator,故在此更新)
         if (wpath !== debugRoot) debugRoot = wpath
         if (!(await isEnabledFresh(wpath))) return decision
-        const verdict = await decideAndKeywords(agent, query, payload.signal)
+        const cmode = await classifierModeFor(wpath)
+        const verdict = await decideAndKeywords(agent, query, payload.signal, cmode, wpath)
         const curSt = stats.get(wpath) || {}
         const intents = Object.assign({}, curSt.intents)
         intents[verdict.intent] = (intents[verdict.intent] || 0) + 1
