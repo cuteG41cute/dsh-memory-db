@@ -1218,16 +1218,17 @@ export class MemoryDbService extends Service {
     // 打开（或校验/重建）索引；返回可用的 DatabaseSync 或 null（回退）
     function ftsEnsure(wpath, state) {
       const f = ftsStateOf(state)
-      if (!sqliteNS || !state.db || f.failed) return null
+      if (!sqliteNS) { debugLog('fts: skipped (module not loaded yet)'); return null }
+      if (!state.db) { debugLog('fts: skipped (db not loaded)'); return null }
+      if (f.failed) return null
       const db = state.db
       const stamp = db.entries.length + '|' + (db.entries.length ? db.entries[db.entries.length - 1].id : '') + '|' + (state.rev || 0)
       if (f.db && f.stamp === stamp) return f.db
       try {
         if (!f.db) {
-          const p = String(state.dbPath || '')
-          const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
-          if (cut <= 0) { f.failed = true; return null }
-          const pdb = new sqliteNS.DatabaseSync(p.slice(0, cut + 1) + 'index.sqlite')
+          // wpath 是真实文件系统路径,直接拼接;不依赖 fs.resolve 的返回格式
+          const p = joinPath(wpath, '.dsh/memory-db/index.sqlite')
+          const pdb = new sqliteNS.DatabaseSync(p)
           pdb.exec("PRAGMA journal_mode=WAL; CREATE VIRTUAL TABLE IF NOT EXISTS mem USING fts5(q, a, s, eid UNINDEXED, tokenize='unicode61');")
           f.db = pdb
         }
