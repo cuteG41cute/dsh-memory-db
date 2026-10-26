@@ -501,6 +501,7 @@ export class MemoryDbService extends Service {
     const PLUGIN = 'memory-db'
     const CONFIG_REL = '.dsh/memory-db/config.json'
     const DB_REL = '.dsh/memory-db/memory.json'
+    const VERDICT_REL = '.dsh/memory-db/verdicts.json'
     const DEBUG_REL = '.dsh/memory-db/debug.log'
     const KEY_DEFAULT = '__default__'
     const DEFAULT_ENABLED = false
@@ -831,8 +832,35 @@ export class MemoryDbService extends Service {
       for (const sid of Object.keys(titleHistoryRaw)) {
         if (Array.isArray(titleHistoryRaw[sid])) titleHistory.set(sid, titleHistoryRaw[sid])
       }
+      // 判定对话流:跨进程重启保留(v0.5.7)
+      if (!Array.isArray(state.verdicts) || state.verdicts.length === 0) {
+        try {
+          if (fs) {
+            const vt = await fs.resolve(joinPath(wpath, VERDICT_REL))
+            const vinfo = await fs.stat(vt)
+            if (vinfo) {
+              const vparsed = JSON.parse(await fs.readText(vt))
+              if (Array.isArray(vparsed)) state.verdicts = vparsed.slice(-10)
+            }
+          }
+        } catch { /* ignore */ }
+      }
       state.db = { entries, keys, titleHistory, sessionTitles: new Map() }
       return state.db
+    }
+    // 判定记录落盘(去抖:同一内容不重复写)
+    function queueSaveVerdicts(wpath) {
+      const state = ensureState(wpath)
+      const vs = state.verdicts || []
+      if (vs.length === 0) return
+      const snapshot = JSON.stringify(vs)
+      if (state.verdictSaved === snapshot) return
+      state.verdictChain = (state.verdictChain || Promise.resolve()).then(async () => {
+        if (!fs) return
+        const target = await fs.resolve(joinPath(wpath, VERDICT_REL))
+        await fs.writeText(target, snapshot, undefined, undefined, writePolicy(wpath))
+        state.verdictSaved = snapshot
+      }).catch((e) => { debugLog('verdicts save failed: ' + (e && e.message)) })
     }
     function queueSave(wpath) {
       const state = ensureState(wpath)
@@ -2835,6 +2863,7 @@ export class MemoryDbService extends Service {
             keywords: (verdict.keywords || []).slice(0, 6),
           })
           while (vs.length > 10) vs.shift()
+          queueSaveVerdicts(wpath)
         }
         // 目的模式:按"历史里最后一条 mode 消息"判定当前生效模式,切换时注入对应提示(无状态,支持任意次往返)
         // 可按项目关闭(角色扮演等项目):purposeMode=false 时不注入任何工况/闲聊模式提示词

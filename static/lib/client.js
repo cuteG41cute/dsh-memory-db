@@ -80,15 +80,22 @@ window.__ModuleLoader__.load({
         const followRef = react.useRef(true)
         react.useEffect(() => {
           let alive = true
+          let retry = null
           setState(null)
           setError(null)
-          rpc('state', { sessionId: props.sessionId }).then((r) => {
-            if (alive && r && r.ok === true) setState(r)
-          }).catch((e) => {
-            console.error('[memory-db] state read failed', e)
-            if (alive) setError('状态读取失败')
-          })
-          return () => { alive = false }
+          // 启动初期会话可能尚未在 host 注册(workspaceId 为空),此时持续重试直到就绪
+          const load = () => {
+            rpc('state', { sessionId: props.sessionId }).then((r) => {
+              if (!alive || !r || r.ok !== true) return
+              setState(r)
+              if (!r.workspaceId) retry = setTimeout(load, 2000)
+            }).catch((e) => {
+              console.error('[memory-db] state read failed', e)
+              if (alive) { setError('状态读取失败'); retry = setTimeout(load, 2000) }
+            })
+          }
+          load()
+          return () => { alive = false; if (retry) clearTimeout(retry) }
         }, [props.sessionId])
         react.useEffect(() => {
           if (!menuOpen) return
@@ -125,12 +132,14 @@ window.__ModuleLoader__.load({
         if (state === null) return null
         const enabled = state.enabled === true
         const purpose = panel ? panel.purposeMode === true : null
-        const scope = state.workspaceId ? (state.title || '当前项目') : '全局默认'
+        // 会话刚启动时 state 可能先拿到 workspaceId=null；用面板数据兜底
+        const wsId = state.workspaceId || (panel && panel.workspaceId) || null
+        const scope = wsId ? (state.title || (panel && panel.title) || '当前项目') : '全局默认'
         const flip = () => {
-          if (busy) return
+          if (busy || !wsId) return
           setBusy(true)
           setError(null)
-          rpc('set-enabled', { workspaceId: state.workspaceId, enabled: !enabled }).then((r) => {
+          rpc('set-enabled', { workspaceId: wsId, enabled: !enabled }).then((r) => {
             if (r && r.ok === true) {
               setState({ ...state, enabled: r.enabled })
             } else {
@@ -152,9 +161,9 @@ window.__ModuleLoader__.load({
           })
         }
         const flipPurpose = () => {
-          if (purposeBusy || purpose === null || !state.workspaceId) return
+          if (purposeBusy || purpose === null || !wsId) return
           setPurposeBusy(true)
-          rpc('set-purpose', { workspaceId: state.workspaceId, enabled: !purpose }).then((r) => {
+          rpc('set-purpose', { workspaceId: wsId, enabled: !purpose }).then((r) => {
             if (r && r.ok === true) setPanel(function (p) { return p ? Object.assign({}, p, { purposeMode: r.purposeMode === true }) : p })
             else console.error('[memory-db] set-purpose rejected: ' + ((r && r.reason) || 'unknown'))
           }).catch((e) => {
@@ -233,7 +242,7 @@ window.__ModuleLoader__.load({
                 react.createElement('span', { key: 'l', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary, #222)' } }, '记忆库（' + scope + '）'),
                 react.createElement('button', { key: 's', onClick: flip, disabled: busy, style: pill(enabled) }, busy ? '…' : (enabled ? '开' : '关')),
               ]),
-              (state.workspaceId) ? react.createElement('div', { key: 'r2', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } }, [
+              (wsId) ? react.createElement('div', { key: 'r2', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } }, [
                 react.createElement('span', { key: 'l', title: '工况判定（本项目）：开启后每轮判定用户目的（闲聊陪伴/执行任务）并注入对应提示词；角色扮演等项目可关闭。', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary, #222)', cursor: 'default' } }, '工况判定'),
                 react.createElement('button', { key: 's', onClick: flipPurpose, disabled: purposeBusy || purpose === null, title: '工况判定（本项目）：' + (purpose ? '开' : '关'), style: pill(purpose) }, purpose === null ? '…' : (purpose ? '开' : '关')),
               ]) : null,
