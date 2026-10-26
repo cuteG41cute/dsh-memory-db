@@ -1337,8 +1337,9 @@ export class MemoryDbService extends Service {
       lines.push('答: ' + String(h.answer).slice(0, 1500))
       return lines.join('\n')
     }
-    function memoryHead(keywords) {
-      return '【历史记忆参考 · 项目记忆库】以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
+    function memoryHead(keywords, purpose) {
+      const mode = purpose === 'chat' ? '闲聊陪伴' : '执行任务'
+      return '【历史记忆参考 · 项目记忆库】当前工况: ' + mode + '。以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
     }
     function memoryTail() {
       return '\n\n请以以上记忆资料为参考判断用户意图，再回答用户当前的问题；若记忆与当前问题无关则忽略。'
@@ -1409,8 +1410,8 @@ export class MemoryDbService extends Service {
       }
       return merged
     }
-    async function buildStandardText(db, hits, budgets, keywords, agent, signal) {
-      const head = memoryHead(keywords)
+    async function buildStandardText(db, hits, budgets, keywords, agent, signal, purpose) {
+      const head = memoryHead(keywords, purpose)
       const tail = memoryTail()
       const originalCap = Math.min(Math.round(budgets.window * 0.2), budgets.injectCap)
       let used = estimateTokens(head) + estimateTokens(tail)
@@ -1430,9 +1431,9 @@ export class MemoryDbService extends Service {
       }
       return text
     }
-    function buildLightText(db, hits, budgets, keywords) {
+    function buildLightText(db, hits, budgets, keywords, purpose) {
       const cap = Math.min(Math.round(budgets.window * 0.05), budgets.available)
-      const head = memoryHead(keywords)
+      const head = memoryHead(keywords, purpose)
       const tail = memoryTail()
       let used = estimateTokens(head) + estimateTokens(tail)
       let body = ""
@@ -1466,9 +1467,9 @@ export class MemoryDbService extends Service {
       const budgets = await computeBudgets(agent, mode)
       let text = null
       if (mode === 'single') {
-        text = buildLightText(state.db, hits, budgets, keywords)
+        text = buildLightText(state.db, hits, budgets, keywords, verdict.purpose)
       } else {
-        text = await buildStandardText(state.db, hits, budgets, keywords, agent, signal)
+        text = await buildStandardText(state.db, hits, budgets, keywords, agent, signal, verdict.purpose)
       }
       if (!text) return null
       return { text, mode, budgets, count: hits.length }
