@@ -77,30 +77,6 @@ window.__ModuleLoader__.load({
         const wrapRef = react.useRef(null)
         const menuRef = react.useRef(null)
         react.useEffect(() => {
-          const onMove = function (e) {
-            const wrap = wrapRef.current
-            if (!wrap) return
-            const pad = 3
-            const wr = wrap.getBoundingClientRect()
-            let inside = e.clientX >= wr.left - pad && e.clientX <= wr.right + pad &&
-              e.clientY >= wr.top - pad && e.clientY <= wr.bottom + pad
-            if (!inside) {
-              const menu = menuRef.current
-              if (menu) {
-                const mr = menu.getBoundingClientRect()
-                inside = e.clientX >= mr.left - pad && e.clientX <= mr.right + pad &&
-                  e.clientY >= mr.top - pad && e.clientY <= mr.bottom + pad
-              }
-            }
-            if (!inside) {
-              setMenuOpen(false)
-              setMenuHover(false)
-            }
-          }
-          document.addEventListener('mousemove', onMove)
-          return function () { document.removeEventListener('mousemove', onMove) }
-        }, [])
-        react.useEffect(() => {
           let alive = true
           setState(null)
           setError(null)
