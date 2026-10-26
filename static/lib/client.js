@@ -70,13 +70,12 @@ window.__ModuleLoader__.load({
         const [state, setState] = react.useState(null)
         const [busy, setBusy] = react.useState(false)
         const [error, setError] = react.useState(null)
-        const [purpose, setPurpose] = react.useState(null)
-        const [purposeBusy, setPurposeBusy] = react.useState(false)
         const [menuOpen, setMenuOpen] = react.useState(false)
         const [menuHover, setMenuHover] = react.useState(false)
+        const [panel, setPanel] = react.useState(null)
+        const [purposeBusy, setPurposeBusy] = react.useState(false)
         const wrapRef = react.useRef(null)
         const menuRef = react.useRef(null)
-        const openMenu = () => { setMenuOpen(true) }
         react.useEffect(() => {
           const onMove = function (e) {
             const wrap = wrapRef.current
@@ -114,15 +113,17 @@ window.__ModuleLoader__.load({
           return () => { alive = false }
         }, [props.sessionId])
         react.useEffect(() => {
+          if (!menuOpen) return
           let alive = true
-          setPurpose(null)
-          rpc('purpose-state', { sessionId: props.sessionId }).then((r) => {
-            if (alive && r && r.ok === true) setPurpose(r.purposeMode === true)
-          }).catch(() => { /* 工况开关读取失败时隐藏菜单项 */ })
+          setPanel(null)
+          rpc('panel-state', { sessionId: props.sessionId }).then((r) => {
+            if (alive && r && r.ok === true) setPanel(r)
+          }).catch((e) => { console.error('[memory-db] panel-state failed', e) })
           return () => { alive = false }
-        }, [props.sessionId])
+        }, [menuOpen, props.sessionId])
         if (state === null) return null
         const enabled = state.enabled === true
+        const purpose = panel ? panel.purposeMode === true : null
         const scope = state.workspaceId ? (state.title || '当前项目') : '全局默认'
         const flip = () => {
           if (busy) return
@@ -141,7 +142,6 @@ window.__ModuleLoader__.load({
           }).then(() => setBusy(false))
         }
         const openAdmin = () => {
-          setMenuOpen(false)
           rpc('open-admin', {}).then((r) => {
             if (!r || r.ok !== true) {
               console.error('[memory-db] open-admin failed: ' + ((r && r.reason) || 'unknown'))
@@ -154,13 +154,31 @@ window.__ModuleLoader__.load({
           if (purposeBusy || purpose === null || !state.workspaceId) return
           setPurposeBusy(true)
           rpc('set-purpose', { workspaceId: state.workspaceId, enabled: !purpose }).then((r) => {
-            if (r && r.ok === true) setPurpose(r.purposeMode === true)
+            if (r && r.ok === true) setPanel(function (p) { return p ? Object.assign({}, p, { purposeMode: r.purposeMode === true }) : p })
             else console.error('[memory-db] set-purpose rejected: ' + ((r && r.reason) || 'unknown'))
           }).catch((e) => {
             console.error('[memory-db] set-purpose failed', e)
           }).then(() => setPurposeBusy(false))
         }
         const dotColor = error ? 'var(--dsw-alias-state-error-primary, #d92d20)' : (enabled ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'var(--dsw-alias-label-caption, #9a9a9a)')
+        const pill = function (on) {
+          return {
+            ...chipStyle,
+            flexShrink: 0,
+            minWidth: 44,
+            justifyContent: 'center',
+            padding: '2px 12px',
+            background: on ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'transparent',
+            color: on ? '#fff' : 'var(--dsw-alias-label-secondary, #8a8a8a)',
+            borderColor: on ? 'transparent' : 'var(--dsw-alias-divider, rgba(128,128,128,0.35))',
+          }
+        }
+        const fmtBytes = function (n) {
+          if (n === undefined || n === null) return '—'
+          if (n < 1024) return n + ' B'
+          if (n < 1048576) return (n / 1024).toFixed(1) + ' KB'
+          return (n / 1048576).toFixed(2) + ' MB'
+        }
         const title = error
           ? '项目记忆库（' + scope + '）：' + error + '——点击重试'
           : '项目记忆库（' + scope + '）：当前' + (enabled ? '开' : '关') + '，点击切换。开启后自动收集该项目问答对话，并在每个任务前检索注入相关历史记忆。'
@@ -168,14 +186,13 @@ window.__ModuleLoader__.load({
           key: 'wrap',
           ref: wrapRef,
           style: { position: 'relative', display: 'inline-flex' },
-          onMouseEnter: openMenu,
         }, [
           react.createElement('button', {
             key: 'chip',
-            onClick: flip,
+            onClick: function () { setMenuOpen(!menuOpen) },
             disabled: busy,
             title: title,
-            style: chipStyle,
+            style: { ...chipStyle, background: menuOpen ? 'var(--dsw-alias-fill-secondary, #f0f2f5)' : 'transparent' },
           }, [
             react.createElement('span', { key: 'd', style: { width: 8, height: 8, borderRadius: '50%', display: 'inline-block', flex: 'none', background: dotColor } }),
             react.createElement('span', { key: 't' }, error ? '写入失败' : ('记忆库 ' + (enabled ? '开' : '关'))),
@@ -185,59 +202,62 @@ window.__ModuleLoader__.load({
             ref: menuRef,
             style: {
               position: 'absolute',
-              top: 'calc(100% + 4px)',
-              left: 0,
+              top: 'calc(100% + 6px)',
               right: 0,
               zIndex: 200,
+              width: 300,
               background: '#fff',
               border: '1px solid var(--dsw-alias-divider, rgba(128,128,128,0.35))',
-              borderRadius: 8,
-              boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-              padding: 4,
-              display: 'flex',
-              flexDirection: 'column',
+              borderRadius: 10,
+              boxShadow: '0 6px 24px rgba(0,0,0,0.14)',
+              overflow: 'hidden',
             },
           }, [
-            react.createElement('button', {
-              key: 'admin',
-              onClick: openAdmin,
-              onMouseEnter: function () { setMenuHover(true) },
-              onMouseLeave: function () { setMenuHover(false) },
-              style: {
-                ...menuItemStyle,
-                background: menuHover ? 'var(--dsw-alias-fill-secondary, #f0f2f5)' : 'transparent',
-              },
+            react.createElement('div', {
+              key: 'head',
+              style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', borderBottom: '1px solid var(--dsw-alias-divider, rgba(128,128,128,0.2))' },
             }, [
-              react.createElement('span', { key: 't' }, '记忆管理'),
+              react.createElement('span', { key: 't', style: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary, #222)' } }, '记忆库'),
+              react.createElement('button', {
+                key: 'c',
+                onClick: function () { setMenuOpen(false) },
+                style: { ...chipStyle, padding: '2px 10px', fontSize: 11 },
+              }, '关闭'),
             ]),
-            (purpose !== null && state.workspaceId) ? react.createElement('button', {
-              key: 'purpose',
-              onClick: flipPurpose,
-              disabled: purposeBusy,
-              title: '工况判定（本项目）：' + (purpose ? '开' : '关') + '，点击切换。开启后每轮判定用户目的（闲聊陪伴/执行任务）并注入对应提示词；角色扮演等项目可关闭。',
-              style: {
-                ...menuItemStyle,
-                justifyContent: 'space-between',
-                padding: '5px 10px',
-                gap: 8,
-                opacity: purposeBusy ? 0.6 : 1,
-              },
+            react.createElement('div', {
+              key: 'body',
+              style: { padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 8 },
             }, [
-              react.createElement('span', { key: 'l', style: { color: 'var(--dsw-alias-label-primary, #222)' } }, '工况判定'),
-              react.createElement('span', {
-                key: 'p',
-                style: {
-                  ...chipStyle,
-                  flexShrink: 0,
-                  padding: '1px 10px',
-                  fontSize: 11,
-                  lineHeight: '16px',
-                  background: purpose ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'transparent',
-                  color: purpose ? '#fff' : 'var(--dsw-alias-label-secondary, #8a8a8a)',
-                  borderColor: purpose ? 'transparent' : 'var(--dsw-alias-divider, rgba(128,128,128,0.35))',
-                },
-              }, purpose ? '开' : '关'),
-            ]) : null,
+              react.createElement('div', { key: 'r1', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } }, [
+                react.createElement('span', { key: 'l', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary, #222)' } }, '记忆库（' + scope + '）'),
+                react.createElement('button', { key: 's', onClick: flip, disabled: busy, style: pill(enabled) }, busy ? '…' : (enabled ? '开' : '关')),
+              ]),
+              (state.workspaceId) ? react.createElement('div', { key: 'r2', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } }, [
+                react.createElement('span', { key: 'l', title: '工况判定（本项目）：开启后每轮判定用户目的（闲聊陪伴/执行任务）并注入对应提示词；角色扮演等项目可关闭。', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary, #222)', cursor: 'default' } }, '工况判定'),
+                react.createElement('button', { key: 's', onClick: flipPurpose, disabled: purposeBusy || purpose === null, title: '工况判定（本项目）：' + (purpose ? '开' : '关'), style: pill(purpose) }, purpose === null ? '…' : (purpose ? '开' : '关')),
+              ]) : null,
+              react.createElement('div', { key: 'r3' }, [
+                react.createElement('span', {
+                  key: 'link',
+                  onClick: openAdmin,
+                  style: { fontSize: 13, color: 'var(--dsw-static-deepseek-500, #4d6bfe)', cursor: 'pointer' },
+                }, '记忆管理 →'),
+              ]),
+              react.createElement('div', {
+                key: 'sep',
+                style: { borderTop: '1px solid var(--dsw-alias-divider, rgba(128,128,128,0.2))', margin: '2px 0' },
+              }),
+              react.createElement('div', {
+                key: 'info',
+                style: { fontSize: 12, lineHeight: '19px', color: 'var(--dsw-alias-label-secondary, #8a8a8a)' },
+              }, panel ? [
+                react.createElement('div', { key: 'i1' }, '记录条数: ' + panel.count + ' 条 · 数据: ' + fmtBytes(panel.dbBytes)),
+                react.createElement('div', { key: 'i2' }, '最近判定: ' + (panel.lastDecision ? (panel.lastDecision + ' · ' + (panel.lastChannel || '-')) : '暂无')),
+                react.createElement('div', { key: 'i3' }, '注入 ' + (panel.injections || 0) + ' 次 · 检索: ' + (panel.engine || '未知')),
+              ] : [
+                react.createElement('div', { key: 'loading' }, '加载中…'),
+              ]),
+            ]),
           ]) : null,
         ])
       },

@@ -2452,6 +2452,46 @@ export class MemoryDbService extends Service {
           await setProjectEnabled(ws.path, enabledNow)
           return { ok: true, enabled: enabledNow }
         }
+        case 'panel-state': {
+          const sessionId = typeof args.sessionId === 'string' ? args.sessionId : undefined
+          const agent = sessionId !== undefined && agents !== undefined ? agents.get(sessionId) : undefined
+          const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
+          const wpath = typeof cwd === 'string' ? workspaceFor(cwd) : undefined
+          if (wpath === undefined) return { ok: false, reason: 'no workspace' }
+          await refreshProject(wpath)
+          const ws = workspaces.find((w) => w.path === wpath)
+          const enabled = ws ? ((await tableEnabled(ws.id, wpath)) ?? ((configCache.get(wpath) || {}).enabled) ?? DEFAULT_ENABLED) : DEFAULT_ENABLED
+          const cfg = await readConfig(wpath)
+          let count = 0
+          try { const db = await loadDb(wpath); count = db.entries.length } catch { /* ignore */ }
+          let dbBytes
+          try {
+            const info = await fs.stat(await fs.resolve(joinPath(wpath, DB_REL)))
+            if (info && typeof info.size === 'number') dbBytes = info.size
+          } catch { /* ignore */ }
+          const st = stats.get(wpath) || {}
+          let engine = '未知'
+          try {
+            const mst = ensureState(wpath)
+            const f = mst.fts
+            if (!f) engine = 'SQLite FTS5(待初始化)'
+            else if (f.failed) engine = '旧版关键词打分(回退)'
+            else if (f.db) engine = 'SQLite FTS5 BM25'
+            else engine = 'SQLite FTS5(待初始化)'
+          } catch { /* ignore */ }
+          let title = null
+          if (ws && workspaceRegistry) {
+            const rec = workspaceRegistry.get(ws.id)
+            if (rec) title = rec.title
+          }
+          return {
+            ok: true, workspaceId: ws ? ws.id : null, title,
+            enabled, purposeMode: cfg.purposeMode !== false,
+            count, dbBytes,
+            lastDecision: st.lastDecision || null, lastChannel: st.lastChannel || null,
+            injections: st.injections || 0, engine,
+          }
+        }
         case 'purpose-state': {
           const sessionId = typeof args.sessionId === 'string' ? args.sessionId : undefined
           const agent = sessionId !== undefined && agents !== undefined ? agents.get(sessionId) : undefined
