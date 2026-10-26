@@ -281,6 +281,20 @@ window.__ModuleLoader__.load({
                       title: '通道: ' + (v.channel || '-'),
                       style: { alignSelf: 'flex-start', maxWidth: '94%', background: 'var(--dsw-alias-fill-secondary, #f0f2f5)', color: 'var(--dsw-alias-label-primary, #333)', padding: '4px 10px', borderRadius: '10px 10px 10px 2px', fontSize: 12, lineHeight: '17px', wordBreak: 'break-all' },
                     }, '【工况】' + (v.purpose === 'chat' ? '闲聊陪伴' : '执行任务') + '　【记忆】' + (v.intent === 'continue' ? '延续·不注入' : v.intent === 'recall' ? '回忆·强制注入' : '转向·注入') + (v.keywords && v.keywords.length > 0 ? '　【关键词】' + v.keywords.join('、') : '')),
+                    (v.input || v.raw) ? react.createElement('details', {
+                      key: 'dbg',
+                      style: { alignSelf: 'flex-start', maxWidth: '94%', fontSize: 11, color: 'var(--dsw-alias-label-secondary, #8a8a8a)' },
+                    }, [
+                      react.createElement('summary', { key: 's', style: { cursor: 'pointer', userSelect: 'none' } }, '查看分类器输入'),
+                      v.input ? react.createElement('div', {
+                        key: 'in',
+                        style: { whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 220, overflowY: 'auto', background: 'var(--dsw-alias-fill-tertiary, #f7f8fa)', border: '1px solid var(--dsw-alias-divider, rgba(128,128,128,0.2))', borderRadius: 6, padding: '6px 8px', marginTop: 4, fontSize: 11, lineHeight: '16px', color: 'var(--dsw-alias-label-primary, #333)' },
+                      }, v.input) : null,
+                      v.raw ? react.createElement('div', {
+                        key: 'out',
+                        style: { whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: 100, overflowY: 'auto', background: 'var(--dsw-alias-fill-tertiary, #f7f8fa)', border: '1px solid var(--dsw-alias-divider, rgba(128,128,128,0.2))', borderRadius: 6, padding: '6px 8px', marginTop: 4, fontSize: 11, lineHeight: '16px', color: 'var(--dsw-alias-label-primary, #333)' },
+                      }, '模型原始输出：\n' + v.raw) : null,
+                    ]) : null,
                   ])
                 }) : [
                   react.createElement('div', { key: 'empty', style: { color: 'var(--dsw-alias-label-caption, #b0b0b0)' } }, '暂无判定记录——发一条消息后，分类器的判定过程会显示在这里'),

@@ -2068,7 +2068,7 @@ export class MemoryDbService extends Service {
         // A 通道必须携带分类器 system 提示,否则模型会把它当普通提问作答(而非输出判定 JSON)
         const out = await askClassifierA(agent, input, signal, undefined, classifierSystemPrompt())
         const parsed = out ? parseClassifierOutput(out) : null
-        if (parsed) return Object.assign(parsed, { channel: 'inline' })
+        if (parsed) return Object.assign(parsed, { channel: 'inline', _input: input, _raw: out })
         debugLog('classifier A unparsable, fallback')
         return null
       }
@@ -2079,7 +2079,7 @@ export class MemoryDbService extends Service {
           if (childRec && childRec.childId) {
             const out = await askClassifierB(agent, childRec.childId, input, signal, childRec.fresh === true)
             const parsed = out ? parseClassifierOutput(out) : null
-            if (parsed) return Object.assign(parsed, { channel: 'subagent' })
+            if (parsed) return Object.assign(parsed, { channel: 'subagent', _input: input, _raw: out })
             debugLog('classifier B unparsable')
           }
         } catch (e) {
@@ -2099,7 +2099,7 @@ export class MemoryDbService extends Service {
         const b = await trySubagent()
         if (b) return b
       }
-      return { intent: 'shift', task: 'normal', purpose: 'task', keywords: tokenize(query).slice(0, 10), channel: 'fallback' }
+      return { intent: 'shift', task: 'normal', purpose: 'task', keywords: tokenize(query).slice(0, 10), channel: 'fallback', _input: input, _raw: null }
     }
 
     async function buildMemoryContext(agent, query, limit) {
@@ -2866,6 +2866,9 @@ export class MemoryDbService extends Service {
             purpose: verdict.purpose || 'task',
             channel: verdict.channel,
             keywords: (verdict.keywords || []).slice(0, 6),
+            // 排查用:分类器实际收到的完整输入与原始输出(面板折叠展示)
+            input: typeof verdict._input === 'string' ? verdict._input.slice(0, 8000) : '',
+            raw: typeof verdict._raw === 'string' ? verdict._raw.slice(0, 2000) : '',
           })
           while (vs.length > 10) vs.shift()
           queueSaveVerdicts(wpath)
