@@ -76,6 +76,8 @@ window.__ModuleLoader__.load({
         const [purposeBusy, setPurposeBusy] = react.useState(false)
         const wrapRef = react.useRef(null)
         const menuRef = react.useRef(null)
+        const bubbleRef = react.useRef(null)
+        const followRef = react.useRef(true)
         react.useEffect(() => {
           let alive = true
           setState(null)
@@ -92,11 +94,34 @@ window.__ModuleLoader__.load({
           if (!menuOpen) return
           let alive = true
           setPanel(null)
-          rpc('panel-state', { sessionId: props.sessionId }).then((r) => {
-            if (alive && r && r.ok === true) setPanel(r)
-          }).catch((e) => { console.error('[memory-db] panel-state failed', e) })
-          return () => { alive = false }
+          const load = () => {
+            rpc('panel-state', { sessionId: props.sessionId }).then((r) => {
+              if (!alive || !r || r.ok !== true) return
+              // 仅在数据真正变化时更新，避免每 500ms 无谓重渲染
+              setPanel(function (prev) {
+                try {
+                  if (prev && JSON.stringify(prev) === JSON.stringify(r)) return prev
+                } catch { /* ignore */ }
+                return r
+              })
+            }).catch((e) => { console.error('[memory-db] panel-state failed', e) })
+          }
+          load()
+          const timer = setInterval(load, 500)
+          return () => { alive = false; clearInterval(timer) }
         }, [menuOpen, props.sessionId])
+        // 气泡区跟随最新：打开面板或在底部时自动滚到底部（用户手动上滚则不打扰）
+        react.useEffect(() => {
+          if (!menuOpen) return
+          followRef.current = true
+          const el = bubbleRef.current
+          if (el) el.scrollTop = el.scrollHeight
+        }, [menuOpen])
+        react.useEffect(() => {
+          if (!followRef.current) return
+          const el = bubbleRef.current
+          if (el) el.scrollTop = el.scrollHeight
+        }, [panel])
         if (state === null) return null
         const enabled = state.enabled === true
         const purpose = panel ? panel.purposeMode === true : null
@@ -230,6 +255,11 @@ window.__ModuleLoader__.load({
                 react.createElement('div', { key: 'i1' }, '记录条数: ' + panel.count + ' 条 · 数据: ' + fmtBytes(panel.dbBytes)),
                 react.createElement('div', {
                   key: 'bubbles',
+                  ref: bubbleRef,
+                  onScroll: function (e) {
+                    const el = e.currentTarget
+                    followRef.current = (el.scrollHeight - el.scrollTop - el.clientHeight) < 48
+                  },
                   style: { display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflowY: 'auto', margin: '6px 0', paddingTop: 6, borderTop: '1px dashed var(--dsw-alias-divider, rgba(128,128,128,0.25))' },
                 }, (panel.verdicts && panel.verdicts.length > 0) ? panel.verdicts.map(function (v, i) {
                   return react.createElement('div', { key: i, style: { display: 'flex', flexDirection: 'column', gap: 3 } }, [
