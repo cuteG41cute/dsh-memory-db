@@ -526,7 +526,11 @@ export class MemoryDbService extends Service {
     // ---- pkg-28 分类器常量 ----
     const CLASSIFY_TIMEOUT_MS = 12000
     const CLASSIFY_POLL_MS = 300
-    const CLASSIFY_ROUNDS = 5
+    const CLASSIFY_ROUNDS = 10
+    // 分类器输入总量上限(字符):超出时从最旧一轮整轮丢弃(滚动截断,不做摘要)
+    const CLASSIFY_INPUT_MAX_CHARS = 24000
+    // subagent 模式:每 150 次判定重建分类器,等价于"抛弃前 146 次,只留最近 4 次 + 重申规则"
+    const CLASSIFIER_ROLLING_LIMIT = 150
     const CLASSIFIER_LABEL = "memory-db 话题分类器"
     // 分类通道:'inline'(默认) = 主模型隐身调用,零子代理、零完成通知、零额外回合;
     // 'subagent' = 常驻分类子代理(成本低但每次判定结算都会给父会话发一条 runtime 通知,
@@ -1631,7 +1635,7 @@ export class MemoryDbService extends Service {
     function classifierSystemPrompt() {
       return '你是「话题延续性分类器」。根据最近对话与当前问题判断用户意图，只输出 JSON。\n' +
       '判断规则（按优先级，短路）：\n' +
-      '1. 回忆需求 recall：用户是否在引用、询问或依赖过往对话信息。显式如"我们之前…""上次你说过…""之前我跟你说过…""你记不记得…""回忆一下…"（仅示例）；更常见是隐式——问题引用了此前讨论过的概念/决定/数据/人名而未重新解释，或含"上次/之前/曾经/当时"等回溯语义。不确定时倾向 recall。\n' +
+      '1. 回忆需求 recall：用户需要的信息**不在上面给出的最近对话里**（更早的对话、跨会话的历史决定/数据/人名），必须从记忆库找回。判定时先自问：回答当前问题所需的关键信息，是否已经在最近对话中出现过？出现过的属于 continue；只有确实缺失才是 recall。显式说法（"我们之前…""上次你说过…""你记不记得…"，仅示例）只是线索，仍以上述"信息是否已在上下文中"为准。确实判断不了信息是否存在时，倾向 recall（宁多勿漏）。\n' +
       '2. 延续 continue：当前问题在推进上一轮话题（同主题追问/补充/修正）。判定时先对照上一轮的助手回复：当前消息是否在回应它提出的问题、选项、方案，或补充它索要的信息？是则视为推进同一话题，而不是新话题——哪怕这条消息本身很短、与上文没有词汇重叠（例如只给出一串代码/链接/路径/凭据，或只回一句"行""选第二个"）。\n' +
       '3. 转向 shift：新话题。此时再判任务类型：single=单次任务（如"今天天气如何？"）；normal=常规话题。\n' +
       'purpose：判断用户当前这句话的主要目的。chat=闲聊陪伴/情绪交流/思想实验与架空世界推演（不需要完成任何现实任务）；task=需要获取信息、执行操作、创作产出、做决策等实际工作。判定的核心是"用户要的是陪伴共鸣还是做事"；要求修改代码、界面、配置、文档或排查问题的请求一律属于 task，即使语气轻松；拿不准时倾向 task。\n' +
@@ -1661,7 +1665,7 @@ export class MemoryDbService extends Service {
       if (intent !== 'continue' && keywords.length === 0) return null
       return { intent, task, purpose, keywords }
     }
-    function recentRoundsText(agent, k) {
+    function recentRoundsText(agent, k, currentQuery) {
       try {
         const session = agent && agent.session
         const events = session && session.events
@@ -1684,14 +1688,23 @@ export class MemoryDbService extends Service {
             }
           }
         }
-        const last = rounds.slice(-k)
-        if (last.length === 0) return ''
-        const parts = []
-        for (let i = 0; i < last.length; i++) {
-          parts.push('用户: ' + last[i].q.slice(0, 500))
-          if (last[i].a) parts.push('助手: ' + last[i].a.slice(0, 800))
+        const qn = String(currentQuery || '').trim()
+        // 当前问题会单独成块给出,这里去掉它,避免重复占用输入
+        const list = (qn && rounds.length > 0 && !rounds[rounds.length - 1].a && rounds[rounds.length - 1].q.trim() === qn)
+          ? rounds.slice(0, -1)
+          : rounds
+        if (list.length === 0) return ''
+        // 全量正文 + 从最新往前累计,超过字符上限就整轮丢弃(滚动截断,不摘要)
+        const picked = []
+        let total = 0
+        for (let i = list.length - 1; i >= 0 && picked.length < k; i--) {
+          const r = list[i]
+          const block = '用户: ' + r.q + (r.a ? '\n助手: ' + r.a : '')
+          if (picked.length > 0 && total + block.length > CLASSIFY_INPUT_MAX_CHARS) break
+          picked.unshift(block)
+          total += block.length
         }
-        return parts.join('\n')
+        return picked.join('\n')
       } catch (e) {
         return ''
       }
@@ -1867,6 +1880,22 @@ export class MemoryDbService extends Service {
         return false
       }
     }
+    // 滚动截断:释放当前分类器子代理,下次判定重建(系统提示重申 + 上下文清零)
+    async function recycleClassifierChild(agent) {
+      const sid = agent && agent.session && agent.session.header ? agent.session.header.id : null
+      if (!sid) return
+      const rec = classifierBySession.get(sid)
+      if (!rec || !rec.childId) return
+      const childId = rec.childId
+      classifierBlacklist.add(childId)
+      classifierChildIds.delete(childId)
+      classifierBySession.delete(sid)
+      try { if (typeof subagents.interrupt === 'function') subagents.interrupt(childId, { kind: 'user', parentSessionId: sid }) } catch (e) { /* noop */ }
+      if (typeof subagents.drainContinuableChildren === 'function') {
+        try { await subagents.drainContinuableChildren(agent, [childId]) } catch (e) { /* noop */ }
+      }
+      debugLog('classifier released for rolling truncation: ' + childId)
+    }
     async function ensureClassifierChild(agent, firstInput, signal) {
       const sid = agent && agent.session && agent.session.header ? agent.session.header.id : null
       if (!sid) return null
@@ -1889,7 +1918,7 @@ export class MemoryDbService extends Service {
             try { await subagents.drainContinuableChildren(agent, [found.childId]) } catch (e) { /* noop */ }
           }
         } else {
-          classifierBySession.set(sid, { childId: found.childId, lastCount: 0 })
+          classifierBySession.set(sid, { childId: found.childId, lastCount: 0, verdicts: (existing && existing.verdicts) || 0 })
           classifierChildIds.add(found.childId)
           debugLog('classifier reuse: found ' + found.count + ' existing child(ren), keep latest ' + found.childId)
           if (found.duplicates.length > 0 && typeof subagents.drainContinuableChildren === 'function') {
@@ -1923,7 +1952,7 @@ export class MemoryDbService extends Service {
         })
         const childId = start && start.childId
         if (!childId) return null
-        classifierBySession.set(sid, { childId, lastCount: 0 })
+        classifierBySession.set(sid, { childId, lastCount: 0, verdicts: 0 })
         classifierChildIds.add(childId)
         debugLog('classifier child created: ' + childId + ' for ' + sid + ' (first input embedded)')
         return { childId, fresh: true }
@@ -2058,7 +2087,7 @@ export class MemoryDbService extends Service {
       return null
     }
     async function decideAndKeywords(agent, query, signal) {
-      const recent = recentRoundsText(agent, CLASSIFY_ROUNDS)
+      const recent = recentRoundsText(agent, CLASSIFY_ROUNDS, query)
       const isFirst = !hasPreviousUser(agent)
       const pending = pendingUserRounds(agent, query)
       const input = buildClassifierInput(query, recent, isFirst, pending)
@@ -2075,6 +2104,16 @@ export class MemoryDbService extends Service {
       const trySubagent = async () => {
         if (subagents === undefined) return null
         try {
+          // 滚动截断:子代理会话会累积判定历史,到 150 次就重建(只留最近若干次 + 重申系统提示)
+          const sid0 = agent && agent.session && agent.session.header ? agent.session.header.id : null
+          const prevRec = sid0 ? classifierBySession.get(sid0) : null
+          if (prevRec) {
+            prevRec.verdicts = (prevRec.verdicts || 0) + 1
+            if (prevRec.verdicts >= CLASSIFIER_ROLLING_LIMIT) {
+              await recycleClassifierChild(agent)
+              debugLog('classifier recycled after ' + CLASSIFIER_ROLLING_LIMIT + ' verdicts (rolling truncation)')
+            }
+          }
           const childRec = await ensureClassifierChild(agent, input, signal)
           if (childRec && childRec.childId) {
             const out = await askClassifierB(agent, childRec.childId, input, signal, childRec.fresh === true)
