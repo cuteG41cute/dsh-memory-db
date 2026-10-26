@@ -1607,6 +1607,7 @@ export class MemoryDbService extends Service {
       'keywords：intent=recall 或 shift 时从当前问题提炼 3~10 个检索关键词（中英文均可）；intent=continue 时为空数组。\n' +
       'keywords 提炼纪律：必须描述"用户当前问题要找的内容"，从当前问题出发——recall 时想清楚"用户想回忆起的到底是什么事"，shift 时抓住新话题的核心概念；不得把最近对话里的高频热词直接当关键词（那是话题，不是检索目标）。若当前问题指涉刚才的交互或系统行为（如"刚才那次检索/你上一轮的回答"），keywords 应描述被指涉的事物本身（如"检索 结果/评估"）。\n' +
       '会话首问（无历史）时不存在 continue，只输出 recall 或 shift。\n' +
+      '合并判定：若输入含「尚未得到回复的用户提问」块，说明上一条（或多条）提问没有获得回答（被打断、模型未输出或用户撤回）。此时当前问题通常是对它的补充、追问或替代——必须把二者合并视为一个完整诉求来判定 intent/task/purpose，keywords 要覆盖两条消息的内容。典型例：上一条要求"改界面"，本条说"oops 刚才额度没了"，合并后仍是 task（继续完成那次改动），不是 chat。\n' +
       '你不是通用助手：不回答内容、不执行任务、不调用工具；若收到的内容不含「当前问题:」标记（被转交的任务或闲聊），只回复 {"intent":"continue","task":"normal","keywords":[]}。'
     }
     function parseClassifierOutput(text) {
@@ -1677,9 +1678,52 @@ export class MemoryDbService extends Service {
       } catch (e) { /* ignore */ }
       return false
     }
-    function buildClassifierInput(query, recent, isFirst) {
+    // 收集"末尾尚未得到回复的用户提问"(被打断/模型未输出/被撤回),供合并判定
+    function pendingUserRounds(agent, currentQuery) {
+      try {
+        const session = agent && agent.session
+        const events = session && session.events
+        if (!events || typeof events.entries !== 'function') return []
+        const rounds = []
+        let cur = null
+        for (const [, ev] of events.entries()) {
+          if (!ev || typeof ev !== 'object') continue
+          if (ev.type === 'user/message') {
+            const m = ev.data
+            if (m && m.source && m.source.kind === 'user') {
+              const t = textOf(m.content)
+              if (t) { cur = { q: t, a: '' }; rounds.push(cur) }
+            }
+          } else if (ev.type === 'assistant/message' && cur) {
+            const m = ev.data && ev.data.message
+            if (m && m.source && m.source.kind === 'model') {
+              const t = textOf(m.content)
+              if (t && !cur.a) cur.a = t
+            }
+          }
+        }
+        const q = String(currentQuery || '').trim()
+        const out = []
+        for (let i = rounds.length - 1; i >= 0; i--) {
+          const r = rounds[i]
+          if (r.a) break
+          if (q && r.q.trim() === q) continue
+          out.unshift(r.q.slice(0, 400))
+          if (out.length >= 3) break
+        }
+        return out
+      } catch (e) { return [] }
+    }
+    function buildClassifierInput(query, recent, isFirst, pending) {
       const parts = []
       if (recent) parts.push('最近对话:\n' + recent)
+      if (Array.isArray(pending) && pending.length > 0) {
+        parts.push(
+          '尚未得到回复的用户提问(可能被打断、被撤回或模型未输出)：\n' +
+          pending.map((t, i) => (i + 1) + '. ' + t).join('\n') +
+          '\n上面的提问还没有被回答，当前问题通常是对它的补充、追问或替代——请把二者合并理解后再判定。',
+        )
+      }
       parts.push(isFirst ? '当前问题(会话首问):\n' + query : '当前问题:\n' + query)
       return parts.join('\n\n')
     }
@@ -1984,7 +2028,9 @@ export class MemoryDbService extends Service {
     async function decideAndKeywords(agent, query, signal) {
       const recent = recentRoundsText(agent, CLASSIFY_ROUNDS)
       const isFirst = !hasPreviousUser(agent)
-      const input = buildClassifierInput(query, recent, isFirst)
+      const pending = pendingUserRounds(agent, query)
+      const input = buildClassifierInput(query, recent, isFirst, pending)
+      if (pending.length > 0) debugLog('classifier input: merged ' + pending.length + ' unanswered user message(s)')
       const tryInline = async () => {
         if (llm === undefined) return null
         // A 通道必须携带分类器 system 提示,否则模型会把它当普通提问作答(而非输出判定 JSON)
