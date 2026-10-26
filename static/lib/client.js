@@ -217,11 +217,26 @@ window.__ModuleLoader__.load({
               title: '工况判定（本项目）：' + (purpose ? '开' : '关') + '，点击切换。开启后每轮判定用户目的（闲聊陪伴/执行任务）并注入对应提示词；角色扮演等项目可关闭。',
               style: {
                 ...menuItemStyle,
+                justifyContent: 'space-between',
+                padding: '5px 10px',
+                gap: 8,
                 opacity: purposeBusy ? 0.6 : 1,
               },
             }, [
-              react.createElement('span', { key: 'd', style: { width: 6, height: 6, borderRadius: '50%', display: 'inline-block', flex: 'none', marginRight: 6, background: purpose ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'var(--dsw-alias-label-caption, #9a9a9a)' } }),
-              react.createElement('span', { key: 't' }, '工况判定 ' + (purpose ? '开' : '关')),
+              react.createElement('span', { key: 'l', style: { color: 'var(--dsw-alias-label-primary, #222)' } }, '工况判定'),
+              react.createElement('span', {
+                key: 'p',
+                style: {
+                  ...chipStyle,
+                  flexShrink: 0,
+                  padding: '1px 10px',
+                  fontSize: 11,
+                  lineHeight: '16px',
+                  background: purpose ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'transparent',
+                  color: purpose ? '#fff' : 'var(--dsw-alias-label-secondary, #8a8a8a)',
+                  borderColor: purpose ? 'transparent' : 'var(--dsw-alias-divider, rgba(128,128,128,0.35))',
+                },
+              }, purpose ? '开' : '关'),
             ]) : null,
           ]) : null,
         ])
