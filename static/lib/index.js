@@ -2452,6 +2452,26 @@ export class MemoryDbService extends Service {
           await setProjectEnabled(ws.path, enabledNow)
           return { ok: true, enabled: enabledNow }
         }
+        case 'purpose-state': {
+          const sessionId = typeof args.sessionId === 'string' ? args.sessionId : undefined
+          const agent = sessionId !== undefined && agents !== undefined ? agents.get(sessionId) : undefined
+          const cwd = agent && agent.session && agent.session.header ? agent.session.header.cwd : undefined
+          const wpath = typeof cwd === 'string' ? workspaceFor(cwd) : undefined
+          if (wpath === undefined) return { ok: false, reason: 'no workspace' }
+          const cfg = await readConfig(wpath)
+          return { ok: true, purposeMode: cfg.purposeMode !== false }
+        }
+        case 'set-purpose': {
+          const wsId = typeof args.workspaceId === 'string' && args.workspaceId !== '' ? args.workspaceId : undefined
+          const on = typeof args.enabled === 'boolean' ? args.enabled : undefined
+          if (on === undefined) return { ok: false, reason: 'bad args' }
+          const ws = wsId !== undefined ? workspaces.find((w) => w.id === wsId) : undefined
+          if (ws === undefined) return { ok: false, reason: 'workspace not found' }
+          const cfg = await readConfig(ws.path)
+          await writeConfig(ws.path, { backfilled: cfg.backfilled, enabled: cfg.enabled, purposeMode: on })
+          debugLog('purpose-mode ' + (on ? 'enabled' : 'disabled') + ' (ui) for ' + ws.path)
+          return { ok: true, purposeMode: on }
+        }
         case 'get-default':
           return { ok: true, enabled: await readDefaultEnabled(), storage: table === null ? (openError || 'unavailable') : 'ok' }
         case 'set-default': {
