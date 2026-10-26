@@ -513,7 +513,9 @@ export class MemoryDbService extends Service {
 
     // ---- pkg-27 上下文优化: 预算常量 ----
     const CONTENT_RATIO = 0.6
-    const BUDGET_RATIO = 0.4
+    const BUDGET_RATIO = 0.2      // 标准注入上限（v0.5.4: 40% → 20%，给模型留更多工作空间）
+    const ORIGINAL_RATIO = 0.15   // 标准注入原文段（v0.5.4: 20% → 15%）
+    const SUMMARY_RATIO = 0.05    // 标准注入摘要段目标（v0.5.4: 20% → 5%）
     const SINGLE_RATIO = 0.05
     const SAFETY_MARGIN = 0.12
     const DEFAULT_CONTEXT_WINDOW = 32768
@@ -1383,7 +1385,7 @@ export class MemoryDbService extends Service {
       return parts
     }
     async function summarizeRemaining(rest, db, budgets, agent, signal) {
-      const target = Math.min(Math.round(budgets.window * 0.2), budgets.injectCap)
+      const target = Math.min(Math.round(budgets.window * SUMMARY_RATIO), Math.max(0, budgets.injectCap - Math.round(budgets.window * ORIGINAL_RATIO)))
       if (target <= 0) return null
       let chunks = []
       let cur = ""
@@ -1420,7 +1422,7 @@ export class MemoryDbService extends Service {
     async function buildStandardText(db, hits, budgets, keywords, agent, signal, purpose) {
       const head = memoryHead(keywords, purpose)
       const tail = memoryTail()
-      const originalCap = Math.min(Math.round(budgets.window * 0.2), budgets.injectCap)
+      const originalCap = Math.min(Math.round(budgets.window * ORIGINAL_RATIO), budgets.injectCap)
       let used = estimateTokens(head) + estimateTokens(tail)
       const originals = []
       for (const h of hits) {
@@ -2694,7 +2696,7 @@ export class MemoryDbService extends Service {
             '生效窗口 ' + budgets.window + '(' + budgets.windowSource + ')',
             '已用≈' + budgets.used + ' 可用=' + budgets.available,
             '内容预算(历史+记忆)=' + budgets.contentCap + '(60%×窗口)',
-            '标准注入上限=' + budgets.injectCap + '(40%∩可用)',
+            '标准注入上限=' + budgets.injectCap + '(20%∩可用)',
             '轻量注入上限=' + lightCap + '(5%∩可用)',
             '历史预算=' + budgets.historyCap + '(内容上限−注入量)',
             '分类通道: 模式=' + CLASSIFIER_MODE + ' B=' + (subagents !== undefined ? (classifierProviderName || 'pending') : 'unavailable') + ' A=' + (llm !== undefined ? 'ok' : 'unavailable') + ' 子代理=' + classifierChildIds.size + ' 最近判定=' + ((st.lastDecision) || '-'),
