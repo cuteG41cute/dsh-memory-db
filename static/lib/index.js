@@ -2490,6 +2490,7 @@ export class MemoryDbService extends Service {
             count, dbBytes,
             lastDecision: st.lastDecision || null, lastChannel: st.lastChannel || null,
             injections: st.injections || 0, engine,
+            verdicts: (function () { const mst = ensureState(wpath); return (mst && mst.verdicts) ? mst.verdicts.slice(-8) : [] })(),
           }
         }
         case 'purpose-state': {
@@ -2773,6 +2774,19 @@ export class MemoryDbService extends Service {
           intents,
         })
         debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
+        // 判定对话流(面板气泡用):最近 N 轮 提问→判定
+        {
+          const vs = state.verdicts || (state.verdicts = [])
+          vs.push({
+            at: Date.now(),
+            q: String(query).slice(0, 80),
+            intent: verdict.intent,
+            purpose: verdict.purpose || 'task',
+            channel: verdict.channel,
+            keywords: (verdict.keywords || []).slice(0, 6),
+          })
+          while (vs.length > 10) vs.shift()
+        }
         // 目的模式:按"历史里最后一条 mode 消息"判定当前生效模式,切换时注入对应提示(无状态,支持任意次往返)
         // 可按项目关闭(角色扮演等项目):purposeMode=false 时不注入任何工况/闲聊模式提示词
         const purposeOn = await purposeModeEnabled(wpath)

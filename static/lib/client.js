@@ -228,7 +228,24 @@ window.__ModuleLoader__.load({
                 style: { fontSize: 12, lineHeight: '19px', color: 'var(--dsw-alias-label-secondary, #8a8a8a)' },
               }, panel ? [
                 react.createElement('div', { key: 'i1' }, '记录条数: ' + panel.count + ' 条 · 数据: ' + fmtBytes(panel.dbBytes)),
-                react.createElement('div', { key: 'i2' }, '最近判定: ' + (panel.lastDecision ? (panel.lastDecision + ' · ' + (panel.lastChannel || '-')) : '暂无')),
+                react.createElement('div', {
+                  key: 'bubbles',
+                  style: { display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 190, overflowY: 'auto', margin: '6px 0', paddingTop: 6, borderTop: '1px dashed var(--dsw-alias-divider, rgba(128,128,128,0.25))' },
+                }, (panel.verdicts && panel.verdicts.length > 0) ? panel.verdicts.map(function (v, i) {
+                  return react.createElement('div', { key: i, style: { display: 'flex', flexDirection: 'column', gap: 3 } }, [
+                    react.createElement('div', {
+                      key: 'q',
+                      style: { alignSelf: 'flex-end', maxWidth: '88%', background: 'var(--dsw-static-deepseek-500, #4d6bfe)', color: '#fff', padding: '4px 10px', borderRadius: '10px 10px 2px 10px', fontSize: 12, lineHeight: '17px', wordBreak: 'break-all' },
+                    }, String(v.q)),
+                    react.createElement('div', {
+                      key: 'a',
+                      title: '通道: ' + (v.channel || '-'),
+                      style: { alignSelf: 'flex-start', maxWidth: '94%', background: 'var(--dsw-alias-fill-secondary, #f0f2f5)', color: 'var(--dsw-alias-label-primary, #333)', padding: '4px 10px', borderRadius: '10px 10px 10px 2px', fontSize: 12, lineHeight: '17px', wordBreak: 'break-all' },
+                    }, '【工况】' + (v.purpose === 'chat' ? '闲聊陪伴' : '执行任务') + '　【记忆】' + (v.intent === 'continue' ? '延续·不注入' : v.intent === 'recall' ? '回忆·强制注入' : '转向·注入') + (v.keywords && v.keywords.length > 0 ? '　【关键词】' + v.keywords.join('、') : '')),
+                  ])
+                }) : [
+                  react.createElement('div', { key: 'empty', style: { color: 'var(--dsw-alias-label-caption, #b0b0b0)' } }, '暂无判定记录——发一条消息后，分类器的判定过程会显示在这里'),
+                ]),
                 react.createElement('div', { key: 'i3' }, '注入 ' + (panel.injections || 0) + ' 次 · 检索: ' + (panel.engine || '未知')),
               ] : [
                 react.createElement('div', { key: 'loading' }, '加载中…'),
