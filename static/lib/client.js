@@ -70,6 +70,8 @@ window.__ModuleLoader__.load({
         const [state, setState] = react.useState(null)
         const [busy, setBusy] = react.useState(false)
         const [error, setError] = react.useState(null)
+        const [purpose, setPurpose] = react.useState(null)
+        const [purposeBusy, setPurposeBusy] = react.useState(false)
         const [menuOpen, setMenuOpen] = react.useState(false)
         const [menuHover, setMenuHover] = react.useState(false)
         const wrapRef = react.useRef(null)
@@ -111,6 +113,14 @@ window.__ModuleLoader__.load({
           })
           return () => { alive = false }
         }, [props.sessionId])
+        react.useEffect(() => {
+          let alive = true
+          setPurpose(null)
+          rpc('purpose-state', { sessionId: props.sessionId }).then((r) => {
+            if (alive && r && r.ok === true) setPurpose(r.purposeMode === true)
+          }).catch(() => { /* 工况开关读取失败时隐藏菜单项 */ })
+          return () => { alive = false }
+        }, [props.sessionId])
         if (state === null) return null
         const enabled = state.enabled === true
         const scope = state.workspaceId ? (state.title || '当前项目') : '全局默认'
@@ -139,6 +149,16 @@ window.__ModuleLoader__.load({
           }).catch((e) => {
             console.error('[memory-db] open-admin failed', e)
           })
+        }
+        const flipPurpose = () => {
+          if (purposeBusy || purpose === null || !state.workspaceId) return
+          setPurposeBusy(true)
+          rpc('set-purpose', { workspaceId: state.workspaceId, enabled: !purpose }).then((r) => {
+            if (r && r.ok === true) setPurpose(r.purposeMode === true)
+            else console.error('[memory-db] set-purpose rejected: ' + ((r && r.reason) || 'unknown'))
+          }).catch((e) => {
+            console.error('[memory-db] set-purpose failed', e)
+          }).then(() => setPurposeBusy(false))
         }
         const dotColor = error ? 'var(--dsw-alias-state-error-primary, #d92d20)' : (enabled ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'var(--dsw-alias-label-caption, #9a9a9a)')
         const title = error
@@ -190,6 +210,19 @@ window.__ModuleLoader__.load({
             }, [
               react.createElement('span', { key: 't' }, '记忆管理'),
             ]),
+            (purpose !== null && state.workspaceId) ? react.createElement('button', {
+              key: 'purpose',
+              onClick: flipPurpose,
+              disabled: purposeBusy,
+              title: '工况判定（本项目）：' + (purpose ? '开' : '关') + '，点击切换。开启后每轮判定用户目的（闲聊陪伴/执行任务）并注入对应提示词；角色扮演等项目可关闭。',
+              style: {
+                ...menuItemStyle,
+                opacity: purposeBusy ? 0.6 : 1,
+              },
+            }, [
+              react.createElement('span', { key: 'd', style: { width: 6, height: 6, borderRadius: '50%', display: 'inline-block', flex: 'none', marginRight: 6, background: purpose ? 'var(--dsw-static-deepseek-500, #4d6bfe)' : 'var(--dsw-alias-label-caption, #9a9a9a)' } }),
+              react.createElement('span', { key: 't' }, '工况判定 ' + (purpose ? '开' : '关')),
+            ]) : null,
           ]) : null,
         ])
       },
