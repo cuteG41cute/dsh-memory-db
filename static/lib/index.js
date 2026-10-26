@@ -529,8 +529,12 @@ export class MemoryDbService extends Service {
     const CLASSIFY_TIMEOUT_MS = 12000
     const CLASSIFY_POLL_MS = 300
     const CLASSIFY_ROUNDS = 10
-    // 分类器输入总量上限(字符):超出时从最旧一轮整轮丢弃(滚动截断,不做摘要)
+    // 分类器输入总量上限(字符):超出时滚动(只保留最近若干轮),避免撑爆窗口
     const CLASSIFY_INPUT_MAX_CHARS = 24000
+    // 滚动条件二:累积满这么多轮对话即滚动(即使字符没超)
+    const CLASSIFIER_ROLL_AFTER_ROUNDS = 150
+    // 滚动后保留的最近轮次(加上当前问题 = "系统提示 + 4 + 1")
+    const CLASSIFIER_KEEP_ROUNDS = 4
     // subagent 模式:每 150 次判定重建分类器,等价于"抛弃前 146 次,只留最近 4 次 + 重申规则"
     const CLASSIFIER_ROLLING_LIMIT = 150
     const CLASSIFIER_LABEL = "memory-db 话题分类器"
@@ -1708,14 +1712,16 @@ export class MemoryDbService extends Service {
     async function loadClassifyCtx(wpath) {
       const state = ensureState(wpath)
       if (state.classifyCtx) return state.classifyCtx
-      let ctx = { text: '', count: 0 }
+      let ctx = { text: '', count: 0, windowCount: 0 }
       try {
         if (fs) {
           const p = await fs.resolve(joinPath(wpath, CLASSIFY_CTX_REL))
           const info = await fs.stat(p)
           if (info) {
             const parsed = JSON.parse(await fs.readText(p))
-            if (parsed && typeof parsed.text === 'string') ctx = { text: parsed.text, count: Number(parsed.count) || 0 }
+            if (parsed && typeof parsed.text === 'string') {
+              ctx = { text: parsed.text, count: Number(parsed.count) || 0, windowCount: Number(parsed.windowCount) || 0 }
+            }
           }
         }
       } catch (e) { /* 首次或损坏时从空开始 */ }
@@ -1726,7 +1732,7 @@ export class MemoryDbService extends Service {
       const state = ensureState(wpath)
       const ctx = state.classifyCtx
       if (!ctx) return
-      const snapshot = JSON.stringify({ text: ctx.text, count: ctx.count, at: Date.now() })
+      const snapshot = JSON.stringify({ text: ctx.text, count: ctx.count, windowCount: ctx.windowCount || 0, at: Date.now() })
       if (state.classifyCtxSaved === snapshot) return
       state.classifyCtxChain = (state.classifyCtxChain || Promise.resolve()).then(async () => {
         if (!fs) return
@@ -1735,7 +1741,8 @@ export class MemoryDbService extends Service {
         state.classifyCtxSaved = snapshot
       }).catch((e) => { debugLog('classify-ctx save failed: ' + (e && e.message)) })
     }
-    // 返回分类器的"历史部分"文本:从固定起点累积,新轮次追加到末尾(前缀稳定)
+    // 返回分类器的"历史部分"文本:从固定起点累积,新轮次追加到末尾(前缀逐字节稳定)
+    // 滚动条件(任一满足):① 累积满 150 轮 ② 字符超上限;滚动后保留最近 4 轮(+ 当前问题)
     async function classifyHistoryText(agent, wpath, k) {
       const ctx = await loadClassifyCtx(wpath)
       const rounds = completedRounds(agent)
@@ -1743,12 +1750,14 @@ export class MemoryDbService extends Service {
         const fresh = rounds.slice(ctx.count)
         for (const r of fresh) ctx.text += (ctx.text ? '\n' : '') + roundBlock(r)
         ctx.count = rounds.length
-        // 超过上限才整体重置一次(只保留最近 k 轮),此后继续累积
-        if (ctx.text.length > CLASSIFY_INPUT_MAX_CHARS) {
-          const keep = rounds.slice(-k)
+        ctx.windowCount = (ctx.windowCount || 0) + fresh.length
+        if (ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS || ctx.text.length > CLASSIFY_INPUT_MAX_CHARS) {
+          const why = ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS ? ('rounds>=' + CLASSIFIER_ROLL_AFTER_ROUNDS) : ('chars>' + CLASSIFY_INPUT_MAX_CHARS)
+          const keep = rounds.slice(-CLASSIFIER_KEEP_ROUNDS)
           ctx.text = keep.map(roundBlock).join('\n')
           ctx.count = rounds.length
-          debugLog('classify ctx reset: keep last ' + keep.length + ' rounds (' + ctx.text.length + ' chars)')
+          ctx.windowCount = keep.length
+          debugLog('classify ctx rolled (' + why + '): keep last ' + keep.length + ' rounds (' + ctx.text.length + ' chars)')
         }
         queueSaveClassifyCtx(wpath)
       }
