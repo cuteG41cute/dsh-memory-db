@@ -1339,7 +1339,7 @@ export class MemoryDbService extends Service {
     }
     function memoryHead(keywords, purpose) {
       const mode = purpose === 'chat' ? '闲聊陪伴' : '执行任务'
-      return '【历史记忆参考 · 项目记忆库】当前工况: ' + mode + '。以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
+      return '【工况判定】当前工况: ' + mode + '\n【历史记忆参考 · 项目记忆库】以下是根据你提炼的关键词「' + keywords.join('、') + '」从项目记忆库中检索到的相关记忆资料，请结合这些记忆作答：'
     }
     function memoryTail() {
       return '\n\n请以以上记忆资料为参考判断用户意图，再回答用户当前的问题；若记忆与当前问题无关则忽略。'
