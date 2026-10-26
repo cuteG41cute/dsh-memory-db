@@ -833,20 +833,24 @@ export class MemoryDbService extends Service {
         if (Array.isArray(titleHistoryRaw[sid])) titleHistory.set(sid, titleHistoryRaw[sid])
       }
       // 判定对话流:跨进程重启保留(v0.5.7)
-      if (!Array.isArray(state.verdicts) || state.verdicts.length === 0) {
-        try {
-          if (fs) {
-            const vt = await fs.resolve(joinPath(wpath, VERDICT_REL))
-            const vinfo = await fs.stat(vt)
-            if (vinfo) {
-              const vparsed = JSON.parse(await fs.readText(vt))
-              if (Array.isArray(vparsed)) state.verdicts = vparsed.slice(-10)
-            }
-          }
-        } catch { /* ignore */ }
-      }
+      await loadVerdictsOnce(wpath)
       state.db = { entries, keys, titleHistory, sessionTitles: new Map() }
       return state.db
+    }
+    // 判定记录文件只在进程内首次需要时读取一次
+    async function loadVerdictsOnce(wpath) {
+      const state = ensureState(wpath)
+      if (state.verdictsLoaded) return
+      state.verdictsLoaded = true
+      try {
+        if (!fs) return
+        const vt = await fs.resolve(joinPath(wpath, VERDICT_REL))
+        const vinfo = await fs.stat(vt)
+        if (vinfo) {
+          const vparsed = JSON.parse(await fs.readText(vt))
+          if (Array.isArray(vparsed) && vparsed.length > 0) state.verdicts = vparsed.slice(-10)
+        }
+      } catch { /* ignore */ }
     }
     // 判定记录落盘(去抖:同一内容不重复写)
     function queueSaveVerdicts(wpath) {
@@ -2852,6 +2856,7 @@ export class MemoryDbService extends Service {
         debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
         // 判定对话流(面板气泡用):最近 N 轮 提问→判定
         {
+          await loadVerdictsOnce(wpath)
           const vst = ensureState(wpath)
           const vs = vst.verdicts || (vst.verdicts = [])
           vs.push({
