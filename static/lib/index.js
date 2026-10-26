@@ -2776,7 +2776,8 @@ export class MemoryDbService extends Service {
         debugLog('classifier: ' + verdict.intent + (verdict.intent === 'shift' ? '/' + verdict.task : '') + (verdict.purpose === 'chat' ? ' +chat' : '') + ' via ' + verdict.channel)
         // 判定对话流(面板气泡用):最近 N 轮 提问→判定
         {
-          const vs = state.verdicts || (state.verdicts = [])
+          const vst = ensureState(wpath)
+          const vs = vst.verdicts || (vst.verdicts = [])
           vs.push({
             at: Date.now(),
             q: String(query).slice(0, 80),
