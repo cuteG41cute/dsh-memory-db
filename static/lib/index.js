@@ -529,12 +529,14 @@ export class MemoryDbService extends Service {
     const CLASSIFY_TIMEOUT_MS = 12000
     const CLASSIFY_POLL_MS = 300
     const CLASSIFY_ROUNDS = 10
-    // 分类器输入总量上限(字符):超出时滚动(只保留最近若干轮),避免撑爆窗口
-    const CLASSIFY_INPUT_MAX_CHARS = 24000
     // 滚动条件二:累积满这么多轮对话即滚动(即使字符没超)
     const CLASSIFIER_ROLL_AFTER_ROUNDS = 150
     // 滚动后保留的最近轮次(加上当前问题 = "系统提示 + 4 + 1")
     const CLASSIFIER_KEEP_ROUNDS = 4
+    // 分类器输入上限:跟随模型窗口动态计算(约占 35%),并留硬上限防内存爆
+    const CLASSIFY_INPUT_RATIO = 0.35
+    const CLASSIFY_INPUT_HARD_CAP = 400000
+    const CLASSIFY_INPUT_FALLBACK_CAP = 24000
     // subagent 模式:每 150 次判定重建分类器,等价于"抛弃前 146 次,只留最近 4 次 + 重申规则"
     const CLASSIFIER_ROLLING_LIMIT = 150
     const CLASSIFIER_LABEL = "memory-db 话题分类器"
@@ -1741,18 +1743,29 @@ export class MemoryDbService extends Service {
         state.classifyCtxSaved = snapshot
       }).catch((e) => { debugLog('classify-ctx save failed: ' + (e && e.message)) })
     }
+    // 分类器输入字符上限:跟随当前模型窗口(1M 窗口 → 35 万字符;256K → 9 万;128K → 4.5 万)
+    async function classifyInputCap(agent) {
+      try {
+        const resolved = await resolveContextWindow(agent)
+        const cap = Math.round(resolved.window * CLASSIFY_INPUT_RATIO)
+        return Math.max(CLASSIFY_INPUT_FALLBACK_CAP, Math.min(cap, CLASSIFY_INPUT_HARD_CAP))
+      } catch (e) {
+        return CLASSIFY_INPUT_FALLBACK_CAP
+      }
+    }
     // 返回分类器的"历史部分"文本:从固定起点累积,新轮次追加到末尾(前缀逐字节稳定)
-    // 滚动条件(任一满足):① 累积满 150 轮 ② 字符超上限;滚动后保留最近 4 轮(+ 当前问题)
+    // 滚动条件(任一满足):① 累积满 150 轮 ② 字符超窗口自适应上限;滚动后保留最近 4 轮(+ 当前问题)
     async function classifyHistoryText(agent, wpath, k) {
       const ctx = await loadClassifyCtx(wpath)
       const rounds = completedRounds(agent)
       if (rounds.length > ctx.count) {
+        const cap = await classifyInputCap(agent)
         const fresh = rounds.slice(ctx.count)
         for (const r of fresh) ctx.text += (ctx.text ? '\n' : '') + roundBlock(r)
         ctx.count = rounds.length
         ctx.windowCount = (ctx.windowCount || 0) + fresh.length
-        if (ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS || ctx.text.length > CLASSIFY_INPUT_MAX_CHARS) {
-          const why = ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS ? ('rounds>=' + CLASSIFIER_ROLL_AFTER_ROUNDS) : ('chars>' + CLASSIFY_INPUT_MAX_CHARS)
+        if (ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS || ctx.text.length > cap) {
+          const why = ctx.windowCount >= CLASSIFIER_ROLL_AFTER_ROUNDS ? ('rounds>=' + CLASSIFIER_ROLL_AFTER_ROUNDS) : ('chars>' + cap)
           const keep = rounds.slice(-CLASSIFIER_KEEP_ROUNDS)
           ctx.text = keep.map(roundBlock).join('\n')
           ctx.count = rounds.length
