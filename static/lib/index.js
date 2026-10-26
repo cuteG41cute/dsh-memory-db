@@ -551,6 +551,8 @@ export class MemoryDbService extends Service {
     const stats = new Map()
 
     const classifierBySession = new Map()
+    // 分类器输入的累积起点(按会话):保持前缀稳定以命中 provider 缓存
+    const classifyWindow = new Map()
     // 已弃用的分类器 id（不可用或被污染）——不再复用，强制新建
     const classifierBlacklist = new Set()
     const classifierChildIds = new Set()
@@ -1694,16 +1696,26 @@ export class MemoryDbService extends Service {
           ? rounds.slice(0, -1)
           : rounds
         if (list.length === 0) return ''
-        // 全量正文 + 从最新往前累计,超过字符上限就整轮丢弃(滚动截断,不摘要)
-        const picked = []
+        // 缓存友好:固定起点累积(而非每轮滑动窗口)——第 N+1 轮输入 = 第 N 轮的完整前缀 + 新增轮次,
+        // 保证 system + 历史逐字节连续 → 命中 provider 前缀缓存(命中价约为未命中的 1/20~1/30)。
+        // 累积超过字符上限时才整体重置一次(从最近 k 轮重新开始),此后继续累积。
+        const sid = session && session.header ? session.header.id : ''
+        const win = classifyWindow.get(sid) || { start: 0 }
+        const blockOf = (r) => '用户: ' + r.q + (r.a ? '\n助手: ' + r.a : '')
+        let start = Math.max(0, Math.min(win.start, list.length - 1))
         let total = 0
-        for (let i = list.length - 1; i >= 0 && picked.length < k; i--) {
-          const r = list[i]
-          const block = '用户: ' + r.q + (r.a ? '\n助手: ' + r.a : '')
-          if (picked.length > 0 && total + block.length > CLASSIFY_INPUT_MAX_CHARS) break
-          picked.unshift(block)
-          total += block.length
+        for (let i = start; i < list.length; i++) total += blockOf(list[i]).length
+        if (total > CLASSIFY_INPUT_MAX_CHARS) {
+          // 重置点:只保留最近 k 轮,下一次判定从这里重新累积
+          start = Math.max(0, list.length - k)
+          total = 0
+          for (let i = start; i < list.length; i++) total += blockOf(list[i]).length
+          debugLog('classify window reset: keep last ' + (list.length - start) + ' rounds (' + total + ' chars)')
         }
+        win.start = start
+        classifyWindow.set(sid, win)
+        const picked = []
+        for (let i = start; i < list.length; i++) picked.push(blockOf(list[i]))
         return picked.join('\n')
       } catch (e) {
         return ''
