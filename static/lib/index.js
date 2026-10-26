@@ -1632,7 +1632,7 @@ export class MemoryDbService extends Service {
       return '你是「话题延续性分类器」。根据最近对话与当前问题判断用户意图，只输出 JSON。\n' +
       '判断规则（按优先级，短路）：\n' +
       '1. 回忆需求 recall：用户是否在引用、询问或依赖过往对话信息。显式如"我们之前…""上次你说过…""之前我跟你说过…""你记不记得…""回忆一下…"（仅示例）；更常见是隐式——问题引用了此前讨论过的概念/决定/数据/人名而未重新解释，或含"上次/之前/曾经/当时"等回溯语义。不确定时倾向 recall。\n' +
-      '2. 延续 continue：当前问题在推进上一轮话题（同主题追问/补充/修正）；也包括"回应式消息"——对上一轮助手提出的问题、选项、方案、请求材料做出回答（如"选方案二""给你XX""都行""不用了""好的"），或补充上一轮所需的信息。即使字面很短、含随机串/凭据/代码、与上文词汇无重叠，只要它在回应上一轮的请求或选项，就属于 continue。\n' +
+      '2. 延续 continue：当前问题在推进上一轮话题（同主题追问/补充/修正）。判定时先对照上一轮的助手回复：当前消息是否在回应它提出的问题、选项、方案，或补充它索要的信息？是则视为推进同一话题，而不是新话题——哪怕这条消息本身很短、与上文没有词汇重叠（例如只给出一串代码/链接/路径/凭据，或只回一句"行""选第二个"）。\n' +
       '3. 转向 shift：新话题。此时再判任务类型：single=单次任务（如"今天天气如何？"）；normal=常规话题。\n' +
       'purpose：判断用户当前这句话的主要目的。chat=闲聊陪伴/情绪交流/思想实验与架空世界推演（不需要完成任何现实任务）；task=需要获取信息、执行操作、创作产出、做决策等实际工作。判定的核心是"用户要的是陪伴共鸣还是做事"；要求修改代码、界面、配置、文档或排查问题的请求一律属于 task，即使语气轻松；拿不准时倾向 task。\n' +
       '输出仅 JSON（不要任何其他文字）：{"intent":"recall|continue|shift","task":"single|normal","purpose":"chat|task","keywords":["..."]}\n' +
@@ -1688,10 +1688,8 @@ export class MemoryDbService extends Service {
         if (last.length === 0) return ''
         const parts = []
         for (let i = 0; i < last.length; i++) {
-          const isLast = i === last.length - 1
-          // 最后一轮(用户最可能回应的那条)放宽截断:方案列表常常在后半段,截掉会导致误判"转向"
-          parts.push('用户: ' + last[i].q.slice(0, isLast ? 1500 : 500))
-          if (last[i].a) parts.push('助手: ' + last[i].a.slice(0, isLast ? 3000 : 800))
+          parts.push('用户: ' + last[i].q.slice(0, 500))
+          if (last[i].a) parts.push('助手: ' + last[i].a.slice(0, 800))
         }
         return parts.join('\n')
       } catch (e) {
