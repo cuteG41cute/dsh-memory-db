@@ -42,6 +42,21 @@
 回合结束 → turn/end 事件 → 问答对自动入库
 ```
 
+## 🧩 DSH 版本兼容
+
+插件适配 **dsh 0.1.x 与 0.2.x**，靠运行时能力检测自动选择实现，不需要按版本装不同包：
+
+| 依赖点 | 0.1.x | 0.2.x（0.1.7-rc.2 起） | 本插件做法 |
+|---|---|---|---|
+| 开关存储 | `settings.register()` / `settings.get()` | **已移除**（改为插件 `static Config` + 组合条目 id + volatile 字段） | 检测到方法存在就用 settings；否则自动降级到 `~/.dsh/dsh-memory-db-switches.json` |
+| 会话事件 | `session.events`（Map） | **已移除**，改为 `session.snapshotEvents()` | 统一封装 `sessionEvents()`，两版都能取 |
+| 客户端通道 | `webServer` 路由 + `fetch` | 同 | 不变 |
+| 工具注册 | `ctx.tools.register` | 同 | 不变 |
+
+**取舍说明**：0.2.x 上不会出现在「设置 → 插件」的表单里（那需要声明 `static Config` 并走 volatile 写入契约）；但所有开关入口照常可用——会话头部芯片、管理网页、`memory_admin` 工具。
+
+---
+
 ## 🚀 使用
 
 ### 安装（静态常驻版，开机自启）

@@ -1,39 +1,39 @@
-{
-  "name": "dsh-memory-db",
-  "version": "0.5.8",
-  "description": "DeepSeek Harness static plugin: per-project memory database 鈥?auto-collects Q&A pairs, three-state classifier (recall/continue/shift), keyword retrieval, budgeted memory injection, admin page. Composition-loaded, survives restarts.",
-  "type": "module",
-  "main": "lib/index.js",
-  "exports": {
-    ".": "./lib/index.js",
-    "./client": "./lib/client.js",
-    "./package.json": "./package.json"
-  },
-  "dsh": {
-    "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-slots"
-      ]
-    }
-  },
-  "files": [
-    "lib"
-  ],
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "cordis",
-    "plugin",
-    "memory",
-    "memory-db"
-  ],
-  "license": "MIT",
-  "author": "cuteG41cute",
-  "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
-  }
+﻿{
+    "name":  "dsh-memory-db",
+    "version":  "0.6.0",
+    "description":  "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Compatible with dsh 0.1.x and 0.2.x (settings API fallback + snapshotEvents).",
+    "type":  "module",
+    "main":  "lib/index.js",
+    "exports":  {
+                    ".":  "./lib/index.js",
+                    "./client":  "./lib/client.js",
+                    "./package.json":  "./package.json"
+                },
+    "dsh":  {
+                "client":  {
+                               "platform":  "web",
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-runtime",
+                                              "@deepseek-ai/dsh-client-ui-settings",
+                                              "@deepseek-ai/dsh-client-ui-slots"
+                                          ]
+                           }
+            },
+    "files":  [
+                  "lib"
+              ],
+    "keywords":  [
+                     "deepseek-harness",
+                     "dsh",
+                     "cordis",
+                     "plugin",
+                     "memory",
+                     "memory-db"
+                 ],
+    "license":  "MIT",
+    "author":  "cuteG41cute",
+    "dependencies":  {
+                         "@deepseek-ai/cordis":  "^4.0.1",
+                         "@deepseek-ai/schemastery":  "^3.18.1"
+                     }
 }

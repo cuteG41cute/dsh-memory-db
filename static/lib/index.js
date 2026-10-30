@@ -19,6 +19,9 @@
 //  5. tools.register: memory_search / memory_admin.
 import { Service } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 export const SETTINGS_NS = 'memory-db'
 /** Source plugin name stamped into injected messages. */
@@ -496,7 +499,90 @@ export class MemoryDbService extends Service {
 
   async [Service.init]() {
     const ctx = this.ctx
-    ctx.settings.register(SETTINGS_NS, memoryDbSettingsSchema)
+    // ── dsh 版本兼容 ───────────────────────────────────────────────────────
+    // dsh >= 0.1.7 的 @deepseek-ai/dsh-settings 移除了 register()/get()
+    // (改为插件 static Config + 组合条目 id + volatile 字段)。
+    // 本插件不追这套易变契约:settings 可用时照旧,否则开关状态落到一个
+    // 普通 JSON 文件(跨版本稳定),插件的检索/注入/收集功能完全不受影响。
+    const settingsApi = ctx.settings
+    const hasSettingsRegister = !!(settingsApi && typeof settingsApi.register === 'function')
+    const hasSettingsGet = !!(settingsApi && typeof settingsApi.get === 'function')
+    const hasSettingsMutate = !!(settingsApi && typeof settingsApi.mutate === 'function')
+    let settingsUsable = hasSettingsRegister && hasSettingsGet
+    if (settingsUsable) {
+      try {
+        ctx.settings.register(SETTINGS_NS, memoryDbSettingsSchema)
+      } catch (e) {
+        settingsUsable = false
+        console.warn('[memory-db] settings.register failed (' + (e && e.message) + ') → switches use file storage')
+      }
+    } else {
+      console.warn('[memory-db] settings.register/get unavailable (dsh >= 0.1.7?) → switches use file storage')
+    }
+    // 降级开关文件:<DSH_HOME>/dsh-memory-db-switches.json
+    const SWITCH_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'dsh-memory-db-switches.json')
+    function readSwitchFile() {
+      try {
+        const j = JSON.parse(readFileSync(SWITCH_FILE, 'utf8'))
+        return {
+          defaultEnabled: j && typeof j.defaultEnabled === 'boolean' ? j.defaultEnabled : undefined,
+          projects: j && j.projects && typeof j.projects === 'object' && !Array.isArray(j.projects) ? j.projects : {},
+        }
+      } catch (e) {
+        return { defaultEnabled: undefined, projects: {} }
+      }
+    }
+    function writeSwitchFile(mutate) {
+      try {
+        const cur = readSwitchFile()
+        const next = mutate(cur) || cur
+        mkdirSync(dirname(SWITCH_FILE), { recursive: true })
+        writeFileSync(SWITCH_FILE, JSON.stringify({ defaultEnabled: next.defaultEnabled, projects: next.projects || {} }, null, 2))
+        return true
+      } catch (e) {
+        console.error('[memory-db] switch file write failed:', e)
+        return false
+      }
+    }
+    // 统一开关读取(settings 优先,不可用则读降级文件)
+    function switchSnapshot() {
+      if (settingsUsable) {
+        try {
+          const raw = ctx.settings.get(SETTINGS_NS)
+          return {
+            source: 'settings',
+            defaultEnabled: raw && typeof raw.defaultEnabled === 'boolean' ? raw.defaultEnabled : undefined,
+            projects: raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {},
+          }
+        } catch (e) { /* fall through to file */ }
+      }
+      const f = readSwitchFile()
+      return { source: 'file', defaultEnabled: f.defaultEnabled, projects: f.projects }
+    }
+    // 统一开关写入(path-addressed ops)
+    async function applySwitchOps(ops) {
+      if (settingsUsable && hasSettingsMutate) {
+        try {
+          await ctx.settings.mutate(SETTINGS_NS, ops)
+          return true
+        } catch (e) {
+          debugLog('settings.mutate failed → file fallback: ' + (e && e.message))
+        }
+      }
+      return writeSwitchFile((cur) => {
+        for (const op of ops) {
+          if (!op || op.op !== 'set' || !Array.isArray(op.path) || op.path.length === 0) continue
+          const head = op.path[0]
+          const key = op.path[1]
+          if (head === 'defaultEnabled') cur.defaultEnabled = op.value === true
+          else if (head === 'projects' && key !== undefined) {
+            if (!cur.projects || typeof cur.projects !== 'object') cur.projects = {}
+            cur.projects[key] = op.value === true
+          }
+        }
+        return cur
+      })
+    }
 
     const PLUGIN = 'memory-db'
     const CONFIG_REL = '.dsh/memory-db/config.json'
@@ -619,10 +705,10 @@ export class MemoryDbService extends Service {
     }
     // 开关解析:settings.yaml 优先,未设置时回退旧配置
     const tableEnabled = async (workspaceId, wpath) => {
-      const raw = ctx.settings.get(SETTINGS_NS)
-      const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
+      const snap = switchSnapshot()
+      const projects = snap.projects || {}
       if (workspaceId !== undefined && typeof projects[workspaceId] === 'boolean') return projects[workspaceId]
-      if (raw && typeof raw.defaultEnabled === 'boolean') return raw.defaultEnabled
+      if (typeof snap.defaultEnabled === 'boolean') return snap.defaultEnabled
       return await legacyEnabled(workspaceId, wpath)
     }
     const readDefaultEnabled = async () => {
@@ -632,9 +718,9 @@ export class MemoryDbService extends Service {
     // 首启迁移:settings 未初始化时,把旧开关(storageDomain memory_db 表 + 项目 config.json)写入 settings.yaml
     async function migrateLegacySettings() {
       try {
-        const raw = ctx.settings.get(SETTINGS_NS)
-        const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
-        if (raw && typeof raw.defaultEnabled === 'boolean') return
+        const snap = switchSnapshot()
+        const projects = snap.projects || {}
+        if (typeof snap.defaultEnabled === 'boolean') return
         if (Object.keys(projects).length > 0) return
         const ops = []
         if (table !== null) {
@@ -654,8 +740,8 @@ export class MemoryDbService extends Service {
           if (v !== undefined) ops.push({ op: 'set', path: ['projects', w.id], value: v })
         }
         if (ops.length > 0) {
-          await ctx.settings.mutate(SETTINGS_NS, ops)
-          debugLog('migrated legacy switches to settings: ' + ops.length + ' ops')
+          await applySwitchOps(ops)
+          debugLog('migrated legacy switches: ' + ops.length + ' ops')
         }
       } catch (e) {
         debugLog('legacy migration failed: ' + (e && e.message))
@@ -800,10 +886,11 @@ export class MemoryDbService extends Service {
     async function enabledSource(wpath) {
       try {
         const ws = workspaces.find((w) => w.path === wpath)
-        const raw = ctx.settings.get(SETTINGS_NS)
-        const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
-        if (ws && typeof projects[ws.id] === 'boolean') return 'settings.yaml(项目)'
-        if (raw && typeof raw.defaultEnabled === 'boolean') return 'settings.yaml(默认)'
+        const snap = switchSnapshot()
+        const projects = snap.projects || {}
+        const label = snap.source === 'settings' ? 'settings.yaml' : 'dsh-memory-db-switches.json'
+        if (ws && typeof projects[ws.id] === 'boolean') return label + '(项目)'
+        if (typeof snap.defaultEnabled === 'boolean') return label + '(默认)'
         if (table !== null) {
           if (ws && table.get(ws.id) !== undefined) return 'storage:memory_db(项目,旧)'
           if (table.get(KEY_DEFAULT) !== undefined) return 'storage:memory_db(默认,旧)'
@@ -818,10 +905,10 @@ export class MemoryDbService extends Service {
       try {
         const cfg = await readConfig(wpath)
         if (!cfg.exists || typeof cfg.enabled !== 'boolean') return
-        const raw = ctx.settings.get(SETTINGS_NS)
-        const projects = raw && typeof raw.projects === 'object' && raw.projects !== null ? raw.projects : {}
+        const snap = switchSnapshot()
+        const projects = snap.projects || {}
         const ws = workspaces.find((w) => w.path === wpath)
-        const hasDecision = (ws && typeof projects[ws.id] === 'boolean') || (raw && typeof raw.defaultEnabled === 'boolean')
+        const hasDecision = (ws && typeof projects[ws.id] === 'boolean') || (typeof snap.defaultEnabled === 'boolean')
         if (!hasDecision) return
         await writeConfig(wpath, { backfilled: cfg.backfilled, purposeMode: cfg.purposeMode, classifierMode: cfg.classifierMode })
         debugLog('legacy config.json enabled field removed: ' + wpath)
@@ -952,7 +1039,7 @@ export class MemoryDbService extends Service {
     async function setProjectEnabled(wpath, enabledNow) {
       const ws = workspaces.find((w) => w.path === wpath)
       if (ws) {
-        await ctx.settings.mutate(SETTINGS_NS, [{ op: 'set', path: ['projects', ws.id], value: enabledNow }])
+        await applySwitchOps([{ op: 'set', path: ['projects', ws.id], value: enabledNow }])
       } else if (fs) {
         const cfg = await readConfig(wpath)
         cfg.enabled = enabledNow
@@ -1406,12 +1493,35 @@ export class MemoryDbService extends Service {
     function memoryTail() {
       return '\n\n请以以上记忆资料为参考判断用户意图，再回答用户当前的问题；若记忆与当前问题无关则忽略。'
     }
+    // ── dsh 版本兼容:session.events 在 dsh >= 0.2 被移除,改用 snapshotEvents() ──
+    // 返回统一快照数组;调用方按"每 step 取一次"使用,不要在循环里反复取。
+    function sessionEvents(session) {
+      if (!session) return []
+      try {
+        if (typeof session.snapshotEvents === 'function') {
+          const arr = session.snapshotEvents()
+          return Array.isArray(arr) ? arr : []
+        }
+      } catch (e) { /* fall through to legacy */ }
+      const ev = session.events
+      if (!ev) return []
+      if (Array.isArray(ev)) return ev
+      try {
+        if (typeof ev.entries === 'function') {
+          const out = []
+          for (const [, v] of ev.entries()) out.push(v)
+          return out
+        }
+        if (typeof ev.values === 'function') return Array.from(ev.values())
+      } catch (e) { /* ignore */ }
+      return []
+    }
     function lastInjectedText(agent) {
       try {
-        const events = agent && agent.session && agent.session.events
-        if (!events || typeof events.entries !== 'function') return null
+        const events = sessionEvents(agent && agent.session)
+        if (events.length === 0) return null
         let last = null
-        for (const [, ev] of events.entries()) {
+        for (const ev of events) {
           if (ev && ev.type === 'user/message') {
             const m = ev.data
             if (m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN) {
@@ -1599,10 +1709,9 @@ export class MemoryDbService extends Service {
     function estimateUsedTokens(agent) {
       let used = SYSTEM_PROMPT_EST
       try {
-        const session = agent && agent.session
-        const events = session && session.events
-        if (events && typeof events.entries === 'function') {
-          for (const [, ev] of events.entries()) {
+        const events = sessionEvents(agent && agent.session)
+        if (events.length > 0) {
+          for (const ev of events) {
             if (!ev || typeof ev !== 'object') continue
             if (ev.type === 'user/message' || ev.type === 'assistant/message') {
               const data = ev.data
@@ -1685,12 +1794,11 @@ export class MemoryDbService extends Service {
     // 从会话日志收集"已完成的问答轮次"(只含拿到助手回复的轮次)
     function completedRounds(agent) {
       try {
-        const session = agent && agent.session
-        const events = session && session.events
-        if (!events || typeof events.entries !== 'function') return []
+        const events = sessionEvents(agent && agent.session)
+        if (events.length === 0) return []
         const rounds = []
         let cur = null
-        for (const [, ev] of events.entries()) {
+        for (const ev of events) {
           if (!ev || typeof ev !== 'object') continue
           if (ev.type === 'user/message') {
             const m = ev.data
@@ -1778,10 +1886,9 @@ export class MemoryDbService extends Service {
     }
     function hasPreviousUser(agent) {
       try {
-        const session = agent && agent.session
-        const events = session && session.events
-        if (!events || typeof events.entries !== 'function') return false
-        for (const [, ev] of events.entries()) {
+        const events = sessionEvents(agent && agent.session)
+        if (events.length === 0) return false
+        for (const ev of events) {
           if (ev && ev.type === 'user/message') {
             const m = ev.data
             if (m && m.source && m.source.kind === 'user' && textOf(m.content)) return true
@@ -1793,12 +1900,11 @@ export class MemoryDbService extends Service {
     // 收集"末尾尚未得到回复的用户提问"(被打断/模型未输出/被撤回),供合并判定
     function pendingUserRounds(agent, currentQuery) {
       try {
-        const session = agent && agent.session
-        const events = session && session.events
-        if (!events || typeof events.entries !== 'function') return []
+        const events = sessionEvents(agent && agent.session)
+        if (events.length === 0) return []
         const rounds = []
         let cur = null
-        for (const [, ev] of events.entries()) {
+        for (const ev of events) {
           if (!ev || typeof ev !== 'object') continue
           if (ev.type === 'user/message') {
             const m = ev.data
@@ -2706,7 +2812,7 @@ export class MemoryDbService extends Service {
         case 'set-default': {
           const enabledNow = typeof args.enabled === 'boolean' ? args.enabled : undefined
           if (enabledNow === undefined) return { ok: false, reason: 'bad args' }
-          await ctx.settings.mutate(SETTINGS_NS, [{ op: 'set', path: ['defaultEnabled'], value: enabledNow }])
+          await applySwitchOps([{ op: 'set', path: ['defaultEnabled'], value: enabledNow }])
           if (!enabledNow) {
             for (const w of workspaces) {
               const eff = await tableEnabled(w.id, w.path)
