@@ -1,7 +1,7 @@
-﻿{
+{
     "name":  "dsh-memory-db",
-    "version":  "0.6.0",
-    "description":  "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Compatible with dsh 0.1.x and 0.2.x (settings API fallback + snapshotEvents).",
+    "version":  "0.6.1",
+    "description":  "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Budget uses real LLM usage tokens (falls back to log estimate); compacts history first when room for injection is insufficient. Compatible with dsh 0.1.x and 0.2.x (settings API fallback + snapshotEvents).",
     "type":  "module",
     "main":  "lib/index.js",
     "exports":  {

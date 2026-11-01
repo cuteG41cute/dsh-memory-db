@@ -610,6 +610,8 @@ export class MemoryDbService extends Service {
     const DEFAULT_CONTEXT_WINDOW = 32768
     const DEFAULT_MAX_TOKENS = 2048
     const SYSTEM_PROMPT_EST = 4000
+    // 腾空间压缩的最小间隔:同一项目 60s 内不重复压缩,避免反复重排历史击穿前缀缓存
+    const COMPACT_MIN_INTERVAL_MS = 60000
 
     // ---- pkg-28 分类器常量 ----
     const CLASSIFY_TIMEOUT_MS = 12000
@@ -1202,10 +1204,11 @@ export class MemoryDbService extends Service {
           if (!wpath || !enabled.get(wpath)) continue
           const state = ensureState(wpath)
           if (!state.db) continue
-          const events = s.events
-          if (!events || typeof events.entries !== 'function') continue
+          // dsh >= 0.2: Session 没有 .events,统一走 sessionEvents() 适配器
+          const events = sessionEvents(s)
+          if (events.length === 0) continue
           let pend = null
-          for (const [, ev] of events.entries()) {
+          for (const ev of events) {
             if (!ev || typeof ev !== 'object') continue
             if (ev.type === 'session/title' && ev.data && typeof ev.data.title === 'string') {
               state.db.sessionTitles.set(header.id, { title: ev.data.title, at: ev.time })
@@ -1596,11 +1599,14 @@ export class MemoryDbService extends Service {
         used += t
       }
       let text = head + originals.join("") + tail
+      let summary = null
       if (originals.length < hits.length) {
         const rest = hits.slice(originals.length)
-        const summary = await summarizeRemaining(rest, db, budgets, agent, signal)
+        summary = await summarizeRemaining(rest, db, budgets, agent, signal)
         if (summary) text = head + originals.join("") + "\n\n【较早的相关记忆摘要】\n" + summary + tail
       }
+      // 一条记忆都放不下时宁可不注入:只发标题+尾注的空块纯属污染上下文
+      if (originals.length === 0 && !summary) return null
       return text
     }
     function buildLightText(db, hits, budgets, keywords, purpose) {
@@ -1619,7 +1625,7 @@ export class MemoryDbService extends Service {
       if (!body) return null
       return head + body + tail
     }
-    async function buildInjection(agent, wpath, verdict, query, signal) {
+    async function buildInjection(agent, wpath, verdict, query, signal, budgetsOverride) {
       const state = ensureState(wpath)
       await loadDb(wpath)
       const keywords = verdict.keywords && verdict.keywords.length > 0 ? verdict.keywords : tokenize(query).slice(0, 10)
@@ -1636,7 +1642,8 @@ export class MemoryDbService extends Service {
       if (hits.length === 0) return null
       addSurfaced(agent.session.header.id, "memory", hits.map((h) => h.question + "\n" + h.answer))
       const mode = verdict.task === 'single' ? 'single' : 'normal'
-      const budgets = await computeBudgets(agent, mode)
+      const budgets = budgetsOverride || await computeBudgets(agent, mode)
+      if (!budgets || budgets.injectCap <= 0) return null
       let text = null
       if (mode === 'single') {
         text = buildLightText(state.db, hits, budgets, keywords, verdict.purpose)
@@ -1648,23 +1655,39 @@ export class MemoryDbService extends Service {
     }
 
 
-    // ---- pkg-30 动态历史压缩(仅注入回合触发) ----
-    async function maybeCompact(agent, wpath, budgets, injectText, signal) {
+    // ---- pkg-30 动态历史压缩(注入前腾空间) ----
+    // 规则:真实可用余量 < 期望注入量(窗口20%)时,先压缩一次历史,再按压缩后的
+    // 假设空间重算预算并注入。压缩后拿不到新 usage,按"内容预算"假设历史已收缩。
+    async function ensureRoom(agent, wpath, budgets, signal) {
       try {
-        if (compaction === undefined) return
-        const injectEst = estimateTokens(injectText || "")
-        const historyCap = Math.max(0, budgets.contentCap - injectEst)
-        const historyEst = Math.max(0, estimateUsedTokens(agent) - SYSTEM_PROMPT_EST)
-        if (historyEst <= historyCap) return
+        if (compaction === undefined) return budgets
+        const need = Math.round(budgets.window * BUDGET_RATIO)
+        if (budgets.available >= need) return budgets
         const prev = compactState.get(wpath)
-        if (prev && Date.now() - prev < 60000) { debugLog("compact skipped (recent)") ; return }
+        if (prev && Date.now() - prev < COMPACT_MIN_INTERVAL_MS) {
+          debugLog('compact skipped (recent) available=' + budgets.available + ' need=' + need)
+          return budgets
+        }
         await compaction.compactNow(agent, signal)
         compactState.set(wpath, Date.now())
         const c4 = stats.get(wpath) || {}
         bumpStats(wpath, { compactions: (c4.compactions || 0) + 1, lastCompactAt: Date.now() })
-        debugLog('compactNow triggered: historyEst=' + historyEst + ' cap=' + historyCap)
+        const used2 = Math.min(budgets.used, budgets.contentCap)
+        const available2 = Math.max(0, budgets.window - used2 - budgets.maxTokens - budgets.safety)
+        const contentCap2 = Math.min(Math.round(budgets.window * CONTENT_RATIO), available2)
+        const injectCap2 = Math.min(Math.round(budgets.window * BUDGET_RATIO), available2)
+        debugLog('compactNow to make room: available=' + budgets.available + ' -> ' + available2 + ' (need=' + need + ')')
+        return Object.assign({}, budgets, {
+          used: used2,
+          usedSource: budgets.usedSource + '+compact',
+          available: available2,
+          contentCap: contentCap2,
+          injectCap: injectCap2,
+          historyCap: Math.max(0, contentCap2 - injectCap2),
+        })
       } catch (e) {
-        debugLog('compactNow failed(下回合重试): ' + (e && e.message))
+        debugLog('compactNow(to make room) failed(下回合重试): ' + (e && e.message))
+        return budgets
       }
     }
 
@@ -1685,7 +1708,9 @@ export class MemoryDbService extends Service {
       const blocks = message && message.content
       if (Array.isArray(blocks)) {
         for (const b of blocks) {
-          if (b && typeof b.text === 'string' && b.text) total += estimateTokens(b.text)
+          // reasoning 块不会回传给模型,计入"已用"会把预算估高
+          if (!b || b.type === 'reasoning') continue
+          if (typeof b.text === 'string' && b.text) total += estimateTokens(b.text)
         }
       }
       return total
@@ -1706,7 +1731,48 @@ export class MemoryDbService extends Service {
       }
       return { window: DEFAULT_CONTEXT_WINDOW, source: 'default:' + DEFAULT_CONTEXT_WINDOW }
     }
-    function estimateUsedTokens(agent) {
+    // 真实用量:最近一条 assistant/message 的 usage(prompt = input + cacheRead + cacheWrite)
+    function lastUsageTokens(agent) {
+      try {
+        const events = sessionEvents(agent && agent.session)
+        if (!events || events.length === 0) return null
+        for (let i = events.length - 1; i >= 0; i--) {
+          const ev = events[i]
+          if (!ev || typeof ev !== 'object' || ev.type !== 'assistant/message') continue
+          const u = ev.data && ev.data.usage
+          if (!u || typeof u !== 'object') continue
+          const input = typeof u.inputTokens === 'number' ? u.inputTokens : 0
+          const cacheRead = typeof u.cacheReadTokens === 'number' ? u.cacheReadTokens : 0
+          const cacheWrite = typeof u.cacheWriteTokens === 'number' ? u.cacheWriteTokens : 0
+          const prompt = input + cacheRead + cacheWrite
+          if (prompt > 0) return { prompt, index: i }
+        }
+      } catch (e) {
+        debugLog('lastUsageTokens failed: ' + (e && e.message))
+      }
+      return null
+    }
+    // 已用上下文:优先用系统真实 usage(上一次请求的 prompt + 之后新增消息),
+    // 适配器没返回 usage 时退回事件日志估算(跳过 reasoning 块)
+    function measureUsedTokens(agent) {
+      const u = lastUsageTokens(agent)
+      if (u) {
+        let used = u.prompt
+        try {
+          const events = sessionEvents(agent && agent.session)
+          // usage 是"发出那条 assistant 消息之前"的 prompt,该消息正文 + 之后的消息要补上
+          for (let i = u.index; i < events.length; i++) {
+            const ev = events[i]
+            if (!ev || typeof ev !== 'object') continue
+            if (ev.type !== 'user/message' && ev.type !== 'assistant/message') continue
+            const d = ev.data || {}
+            used += estimateMessageTokens(d.message || d)
+          }
+        } catch (e) {
+          debugLog('measureUsedTokens delta failed: ' + (e && e.message))
+        }
+        return { used, source: 'usage' }
+      }
       let used = SYSTEM_PROMPT_EST
       try {
         const events = sessionEvents(agent && agent.session)
@@ -1723,12 +1789,16 @@ export class MemoryDbService extends Service {
       } catch (e) {
         debugLog('estimateUsedTokens failed: ' + (e && e.message))
       }
-      return used
+      return { used, source: 'log' }
+    }
+    function estimateUsedTokens(agent) {
+      return measureUsedTokens(agent).used
     }
     async function computeBudgets(agent, mode) {
       const resolved = await resolveContextWindow(agent)
       const window = resolved.window
-      const used = estimateUsedTokens(agent)
+      const measured = measureUsedTokens(agent)
+      const used = measured.used
       const options = agent && agent.options
       const maxTokens = options && typeof options.maxTokens === 'number' ? options.maxTokens : DEFAULT_MAX_TOKENS
       const safety = Math.round(window * SAFETY_MARGIN)
@@ -1740,6 +1810,7 @@ export class MemoryDbService extends Service {
         window,
         windowSource: resolved.source,
         used,
+        usedSource: measured.source,
         maxTokens,
         safety,
         available,
@@ -3000,7 +3071,7 @@ export class MemoryDbService extends Service {
           const intentText = intentKeys.length > 0 ? intentKeys.map((k) => k + '=' + st.intents[k]).join(',') : '暂无'
           const budgetText = [
             '生效窗口 ' + budgets.window + '(' + budgets.windowSource + ')',
-            '已用≈' + budgets.used + ' 可用=' + budgets.available,
+            '已用≈' + budgets.used + '(' + (budgets.usedSource === 'usage' ? '真实usage' : '日志估算') + ') 可用=' + budgets.available,
             '内容预算(历史+记忆)=' + budgets.contentCap + '(60%×窗口)',
             '标准注入上限=' + budgets.injectCap + '(20%∩可用)',
             '轻量注入上限=' + lightCap + '(5%∩可用)',
@@ -3148,9 +3219,11 @@ export class MemoryDbService extends Service {
           messages0.splice(idx0 + 1, 0, ...extraMsgs)
           return { kind: 'enter', messages: messages0 }
         }
-        const inject = await buildInjection(agent, wpath, purposeOn ? verdict : Object.assign({}, verdict, { purpose: undefined }), query, payload.signal)
+        const budgetMode = verdict.task === 'single' ? 'single' : 'normal'
+        let budgets0 = await computeBudgets(agent, budgetMode)
+        budgets0 = await ensureRoom(agent, wpath, budgets0, payload.signal)
+        const inject = await buildInjection(agent, wpath, purposeOn ? verdict : Object.assign({}, verdict, { purpose: undefined }), query, payload.signal, budgets0)
         if (!inject || !inject.text) return decision
-        await maybeCompact(agent, wpath, inject.budgets, inject.text, payload.signal)
         const prevInj = lastInjectedText(agent)
         if (prevInj === inject.text) {
           const c3 = stats.get(wpath) || {}
