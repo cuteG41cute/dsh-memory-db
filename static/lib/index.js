@@ -667,6 +667,22 @@ export class MemoryDbService extends Service {
     const storageDomain = ctx.get('storageDomain')
     const webServer = ctx.get('webServer')
     const subprocess = ctx.get('subprocess')
+
+    // ── 多实例部署 ──────────────────────────────────────────────────────────
+    // 同一台机器可能同时跑多个实例(3080/3081...)。管理页 URL 必须跟随当前
+    // 实例实际监听的端口,不能写死 3080,否则提示文本会把用户导到别的实例。
+    function adminUrl() {
+      const host = webServer && typeof webServer.host === 'string' && webServer.host ? webServer.host : '127.0.0.1'
+      const port = webServer && typeof webServer.port === 'number' && webServer.port > 0 ? webServer.port : 3080
+      return 'http://' + host + ':' + port + ADMIN_PATH
+    }
+    // debug.log 按项目目录共享;多实例写同一项目时用端口前缀区分来源
+    function instanceTag() {
+      try {
+        if (webServer && typeof webServer.port === 'number' && webServer.port > 0) return 'p' + webServer.port
+      } catch (e) { /* ignore */ }
+      return ''
+    }
     const sessionTitle = ctx.get('sessionTitle')
     const llm = ctx.get('llm')
     const subagents = ctx.get('subagents')
@@ -770,7 +786,8 @@ export class MemoryDbService extends Service {
           const lines = existing.split('\n')
           if (lines.length > DEBUG_MAX_LINES) existing = lines.slice(lines.length - DEBUG_MAX_LINES).join('\n')
           const stamp = new Date().toISOString()
-          await fs.writeText(target, (existing ? existing + '\n' : '') + '[' + stamp + '] ' + line, undefined, undefined, writePolicy(debugRoot))
+          const tag = instanceTag()
+          await fs.writeText(target, (existing ? existing + '\n' : '') + '[' + stamp + '] ' + (tag ? '[' + tag + '] ' : '') + line, undefined, undefined, writePolicy(debugRoot))
         }).catch((e) => { console.error('memory-db debug write failed:', e) })
         debugChains.set('debug', chain)
       } catch (e) { /* ignore */ }
@@ -2899,9 +2916,7 @@ export class MemoryDbService extends Service {
         }
         case 'open-admin': {
           if (subprocess === undefined) return { ok: false, reason: 'subprocess 服务不可用' }
-          const host = webServer !== undefined ? webServer.host : '127.0.0.1'
-          const port = webServer !== undefined ? webServer.port : 3080
-          const url = 'http://' + host + ':' + port + ADMIN_PATH
+          const url = adminUrl()
           const cwd = workspaces.length > 0 ? workspaces[0].path : 'C:\\'
           subprocess.spawn({ argv: ['cmd.exe', '/c', 'start', '', url], cwd, stdio: { stdin: 'ignore', stdout: 'inherit', stderr: 'inherit' }, graceMs: 2000 })
           debugLog('open-admin: ' + url)
@@ -3089,7 +3104,7 @@ export class MemoryDbService extends Service {
           ].join('; ')
           const source = await enabledSource(wpath)
           const note = (resolved
-            ? '记忆库已开启，数据库文件: .dsh/memory-db/memory.json；开关实际来源: ' + source + '；管理网页: http://127.0.0.1:3080/memory-db-admin'
+            ? '记忆库已开启，数据库文件: .dsh/memory-db/memory.json；开关实际来源: ' + source + '；管理网页: ' + adminUrl()
             : '记忆库未开启。开启: 点击会话顶部「记忆库」开关，或用本工具 enable。开关实际来源: ' + source + (cfg.exists ? '' : '；旧配置文件不存在')) + '；预算: ' + budgetText
           return {
             action,
@@ -3379,7 +3394,7 @@ export class MemoryDbService extends Service {
               '要求：',
               '- 记忆与当前问题无关或不足时，正常回答即可，不要虚构记忆；',
               '- 不要将记忆检索的中间过程写入最终答案。',
-              '- 记忆库管理网页: http://127.0.0.1:3080/memory-db-admin',
+              '- 记忆库管理网页: ' + adminUrl(),
             ].join('\n')
           } catch (e) {
             return ''
