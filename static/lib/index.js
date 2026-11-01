@@ -585,6 +585,11 @@ export class MemoryDbService extends Service {
     }
 
     const PLUGIN = 'memory-db'
+    // dsh 0.2.x 会话格式 v4:source.kind 必须是"产出方自己的 kind",v3 的
+    // { kind:'plugin', plugin:'<name>' } 会被直接拒绝
+    // (SessionFormatError: format v4 message requires a producer-owned source kind)。
+    // 迁移器 producerKind() 对第三方插件的映射就是 'plugin:<name>'。
+    const PLUGIN_KIND = 'plugin:' + PLUGIN
     const CONFIG_REL = '.dsh/memory-db/config.json'
     const DB_REL = '.dsh/memory-db/memory.json'
     const VERDICT_REL = '.dsh/memory-db/verdicts.json'
@@ -1527,7 +1532,7 @@ export class MemoryDbService extends Service {
         for (const ev of events) {
           if (ev && ev.type === 'user/message') {
             const m = ev.data
-            if (m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN) {
+            if (m && m.source && m.source.kind === PLUGIN_KIND) {
               const t = textOf(m.content)
               if (t) last = t
             }
@@ -2414,7 +2419,7 @@ export class MemoryDbService extends Service {
         id: PLUGIN + '-' + agent.id + '-' + Date.now().toString(36) + '-' + (++msgCounter),
         role: 'user',
         content: [{ type: 'text', text: lines.join('\n') }],
-        source: { kind: 'plugin', plugin: PLUGIN, form: 'recall' },
+        source: { kind: PLUGIN_KIND, form: 'recall' },
       }
     }
 
@@ -3181,7 +3186,7 @@ export class MemoryDbService extends Service {
           let lastChat = false
           let hasMode = false
           for (const m of payload.messages) {
-            if (m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form === 'mode') {
+            if (m && m.source && m.source.kind === PLUGIN_KIND && m.source.form === 'mode') {
               hasMode = true
               const t = Array.isArray(m.content) && m.content[0] && typeof m.content[0].text === 'string' ? m.content[0].text : ''
               lastChat = t === CHAT_MODE_TEXT
@@ -3192,7 +3197,7 @@ export class MemoryDbService extends Service {
               id: PLUGIN + '-mode-' + agent.id + '-' + (++msgCounter),
               role: 'user',
               content: [{ type: 'text', text: CHAT_MODE_TEXT }],
-              source: { kind: 'plugin', plugin: PLUGIN, form: 'mode' },
+              source: { kind: PLUGIN_KIND, form: 'mode' },
             })
             bumpStats(wpath, { chatMode: 'injected' })
             debugLog('pre-step: chat-mode prompt injected for ' + agent.id)
@@ -3201,7 +3206,7 @@ export class MemoryDbService extends Service {
               id: PLUGIN + '-mode-' + agent.id + '-' + (++msgCounter),
               role: 'user',
               content: [{ type: 'text', text: TASK_MODE_TEXT }],
-              source: { kind: 'plugin', plugin: PLUGIN, form: 'mode' },
+              source: { kind: PLUGIN_KIND, form: 'mode' },
             })
             bumpStats(wpath, { chatMode: 'restored' })
             debugLog('pre-step: task-mode prompt restored for ' + agent.id)
@@ -3235,9 +3240,9 @@ export class MemoryDbService extends Service {
           id: PLUGIN + '-' + agent.id + '-' + Date.now().toString(36) + '-' + (++msgCounter),
           role: 'user',
           content: [{ type: 'text', text: inject.text }],
-          source: { kind: 'plugin', plugin: PLUGIN, form: 'recall' },
+          source: { kind: PLUGIN_KIND, form: 'recall' },
         }
-        const already = decision.messages.some((m) => m && m.source && m.source.kind === 'plugin' && m.source.plugin === PLUGIN && m.source.form !== 'mode')
+        const already = decision.messages.some((m) => m && m.source && m.source.kind === PLUGIN_KIND && m.source.form !== 'mode')
         if (!already) extraMsgs.push(ctxMsg)
         if (extraMsgs.length === 0) return decision
         let idx = decision.messages.length - 1
