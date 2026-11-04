@@ -1,0 +1,10 @@
+# dsh-memory-db bundle layer
+#
+# Applied when the profile lists "dsh-memory-db" in dsh.profile.bundles.
+# The row is the same one that used to live in the profile's cordis.patch.yml;
+# moving it here makes the plugin a managed bundle (Plugins page: install /
+# enable / disable), instead of a hand-inserted loader row.
+- insert:
+    - id: dsh-memory-db
+      name: dsh-memory-db
+      inject: [tools]
