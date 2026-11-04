@@ -1,7 +1,7 @@
 {
     "name":  "dsh-memory-db",
-    "version":  "0.6.3",
-    "description":  "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Multi-instance aware: admin URL follows the running instance's webServer port and debug.log lines carry an instance tag. Uses dsh session-format v4 producer-owned source kinds (kind: plugin:memory-db) so injections are accepted on dsh 0.2.x; budget uses real LLM usage tokens; compacts history first when room for injection is insufficient. Compatible with dsh 0.1.x (settings API fallback) and 0.2.x (snapshotEvents).",
+    "version":  "0.6.4",
+    "description":  "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Redacts secret tokens (github_pat_/ghp_/sk-/AKIA/xox*) before storing, injecting and persisting; multi-instance aware (admin URL follows the running webServer port, debug.log lines carry an instance tag). Uses dsh session-format v4 producer-owned source kinds (kind: plugin:memory-db); budget uses real LLM usage tokens; compacts history first when room for injection is insufficient. Compatible with dsh 0.1.x (settings API fallback) and 0.2.x (snapshotEvents).",
     "type":  "module",
     "main":  "lib/index.js",
     "exports":  {

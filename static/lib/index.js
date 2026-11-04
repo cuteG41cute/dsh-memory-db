@@ -809,6 +809,21 @@ export class MemoryDbService extends Service {
       }
       return parts.join('\n').trim()
     }
+    // 密钥脱敏:贴进对话的 token 一旦入库,后续注入/分类会把它再发给模型。
+    // 入库、注入、三个落盘点都过一遍。
+    const SECRET_PATTERNS = [
+      /github_pat_[A-Za-z0-9_]{20,}/g,
+      /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
+      /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+      /\bAKIA[0-9A-Z]{16}\b/g,
+      /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
+    ]
+    function redactSecrets(v) {
+      if (typeof v !== 'string' || v.length === 0) return v
+      let out = v
+      for (const re of SECRET_PATTERNS) out = out.replace(re, '[REDACTED]')
+      return out
+    }
     function iso(ms) {
       try {
         const d = new Date(ms)
@@ -989,7 +1004,7 @@ export class MemoryDbService extends Service {
       const state = ensureState(wpath)
       const vs = state.verdicts || []
       if (vs.length === 0) return
-      const snapshot = JSON.stringify(vs)
+      const snapshot = redactSecrets(JSON.stringify(vs))
       if (state.verdictSaved === snapshot) return
       state.verdictChain = (state.verdictChain || Promise.resolve()).then(async () => {
         if (!fs) return
@@ -1006,7 +1021,7 @@ export class MemoryDbService extends Service {
         const target = await fs.resolve(joinPath(wpath, DB_REL))
         const th = {}
         for (const [sid, arr] of state.db.titleHistory) th[sid] = arr
-        await fs.writeText(target, JSON.stringify({ version: 1, entries: state.db.entries, titleHistory: th }, null, 2), undefined, undefined, writePolicy(wpath))
+        await fs.writeText(target, redactSecrets(JSON.stringify({ version: 1, entries: state.db.entries, titleHistory: th }, null, 2)), undefined, undefined, writePolicy(wpath))
       }).catch((e) => { console.error('memory-db save failed:', e); debugLog('save failed: ' + e.message) })
     }
     function trimDb(state) {
@@ -1307,8 +1322,8 @@ export class MemoryDbService extends Service {
       if (!clean) return false
       const entry = {
         id: 'm' + (++msgCounter) + '-' + Date.now().toString(36),
-        question: String(question).slice(0, 8000),
-        answer: clean.slice(0, 20000),
+        question: redactSecrets(String(question)).slice(0, 8000),
+        answer: redactSecrets(clean).slice(0, 20000),
         time,
         sessionId,
         turn,
@@ -1673,7 +1688,7 @@ export class MemoryDbService extends Service {
         text = await buildStandardText(state.db, hits, budgets, keywords, agent, signal, verdict.purpose)
       }
       if (!text) return null
-      return { text, mode, budgets, count: hits.length }
+      return { text: redactSecrets(text), mode, budgets, count: hits.length }
     }
 
 
@@ -1935,7 +1950,7 @@ export class MemoryDbService extends Service {
       const state = ensureState(wpath)
       const ctx = state.classifyCtx
       if (!ctx) return
-      const snapshot = JSON.stringify({ text: ctx.text, count: ctx.count, windowCount: ctx.windowCount || 0, at: Date.now() })
+      const snapshot = redactSecrets(JSON.stringify({ text: ctx.text, count: ctx.count, windowCount: ctx.windowCount || 0, at: Date.now() }))
       if (state.classifyCtxSaved === snapshot) return
       state.classifyCtxChain = (state.classifyCtxChain || Promise.resolve()).then(async () => {
         if (!fs) return
@@ -2502,8 +2517,8 @@ export class MemoryDbService extends Service {
       if (!state.db) return null
       const entry = {
         id: 'm' + (++msgCounter) + '-' + Date.now().toString(36) + '-a',
-        question: String(question).slice(0, 8000),
-        answer: String(answer).slice(0, 20000),
+        question: redactSecrets(String(question)).slice(0, 8000),
+        answer: redactSecrets(String(answer)).slice(0, 20000),
         time,
       }
       if (typeof sessionTitle === 'string' && sessionTitle) entry.sessionTitle = sessionTitle
