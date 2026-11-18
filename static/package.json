@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-db",
-  "version": "0.6.5",
-  "description": "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Packaged as a bundle so it appears under the Plugins page; redacts secret tokens before storing/injecting/persisting; multi-instance aware (admin URL follows the running webServer port, debug.log lines carry an instance tag). Uses dsh session-format v4 producer-owned source kinds (kind: plugin:memory-db); budget uses real LLM usage tokens; compacts history first when room for injection is insufficient. Compatible with dsh 0.1.x (settings API fallback) and 0.2.x (snapshotEvents).",
+  "version": "0.6.6",
+  "description": "DeepSeek Harness static plugin: per-project memory database (collect/classify/inject/admin page). Zero external runtime dependencies (host code imports only node: builtins; schemastery is an optional dynamic import), so link/junction installs keep working after any pnpm reshuffle. Packaged as a bundle so it appears under the Plugins page; redacts secret tokens before storing/injecting/persisting; multi-instance aware (admin URL follows the running webServer port, debug.log lines carry an instance tag). Uses dsh session-format v4 producer-owned source kinds (kind: plugin:memory-db); budget uses real LLM usage tokens; compacts history first when room for injection is insufficient. Compatible with dsh 0.1.x (settings API fallback) and 0.2.x (snapshotEvents).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -36,9 +36,5 @@
     "memory-db"
   ],
   "license": "MIT",
-  "author": "cuteG41cute",
-  "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/schemastery": "^3.18.1"
-  }
+  "author": "cuteG41cute"
 }

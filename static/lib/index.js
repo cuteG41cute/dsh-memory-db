@@ -17,8 +17,12 @@
 //     the dynamic-plugin harness.handle channel) and /memory-db-admin
 //     (management page).
 //  5. tools.register: memory_search / memory_admin.
-import { Service } from '@deepseek-ai/cordis'
-import s from '@deepseek-ai/schemastery'
+//
+// 零外部依赖:本文件不 import @deepseek-ai/*(cordis/schemastery),只依赖 node: 内置模块。
+// 原因是 link/junction 安装时 Node ESM 会按 realpath 的祖先链解析依赖,而源码目录
+// (release/.../static) 祖先链上没有 node_modules —— 一旦 import cordis 就会
+// ERR_MODULE_NOT_FOUND 导致整个插件激活失败。插件形态改为普通 Cordis 对象插件,
+// schemastery schema 在 settings 可用时才动态 import(失败则退回文件开关)。
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -28,14 +32,6 @@ export const SETTINGS_NS = 'memory-db'
 export const PLUGIN = 'memory-db'
 /** Exact webServer route serving the client JSON API. */
 export const ROUTE_PATH = '/dsh-memory-db/api'
-
-/** Settings namespace schema: global default + per-workspace overrides. */
-// 注意:不设 default —— 未写入时 defaultEnabled 为 undefined,用于区分"未初始化"
-// (此时回退旧 storageDomain/config.json 开关)与"显式设置过"
-export const memoryDbSettingsSchema = s.object({
-  defaultEnabled: s.boolean(),
-  projects: s.dict(s.boolean()),
-})
 
 
 // ============================================================================
@@ -490,15 +486,12 @@ loadTitles();
 </body>
 </html>`
 
-export class MemoryDbService extends Service {
-  static inject = ['settings', 'workspaceRegistry', 'agents', 'webServer', 'timer']
+export const MemoryDbService = {
+  name: 'dsh-memory-db',
+  // 普通 Cordis 对象插件(不继承 Service、不 import cordis)
+  inject: ['settings', 'workspaceRegistry', 'agents', 'webServer', 'timer'],
 
-  constructor(ctx) {
-    super(ctx, 'memoryDb')
-  }
-
-  async [Service.init]() {
-    const ctx = this.ctx
+  async apply(ctx) {
     // ── dsh 版本兼容 ───────────────────────────────────────────────────────
     // dsh >= 0.1.7 的 @deepseek-ai/dsh-settings 移除了 register()/get()
     // (改为插件 static Config + 组合条目 id + volatile 字段)。
@@ -511,6 +504,15 @@ export class MemoryDbService extends Service {
     let settingsUsable = hasSettingsRegister && hasSettingsGet
     if (settingsUsable) {
       try {
+        // schemastery 只有 0.1.x 的 settings.register 需要;动态 import 失败也不能
+        // 影响插件激活(0.2.x 走文件开关)
+        const mod = await import('@deepseek-ai/schemastery')
+        const s = mod && mod.default ? mod.default : mod
+        // 不设 default —— 未写入时 defaultEnabled 为 undefined,用于区分"未初始化"
+        const memoryDbSettingsSchema = s.object({
+          defaultEnabled: s.boolean(),
+          projects: s.dict(s.boolean()),
+        })
         ctx.settings.register(SETTINGS_NS, memoryDbSettingsSchema)
       } catch (e) {
         settingsUsable = false
